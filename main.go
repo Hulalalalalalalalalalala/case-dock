@@ -47,39 +47,63 @@ type ticketInput struct {
 
 // ticket 是保存并返回的工单记录。
 type ticket struct {
-	ID             string `json:"id"`
-	Description    string `json:"description"`
-	ContactName    string `json:"contactName"`
-	ContactInfo    string `json:"contactInfo"`
-	Source         string `json:"source"`
-	Category       string `json:"category"`
-	Priority       string `json:"priority"`
-	AttachmentNote string `json:"attachmentNote"`
-	OrderNumber    string `json:"orderNumber"`
-	Status         string `json:"status"`
-	Assignee       string `json:"assignee"`
-	CreatedAt      string `json:"createdAt"`
-	UpdatedAt      string `json:"updatedAt"`
+	ID             string             `json:"id"`
+	Description    string             `json:"description"`
+	ContactName    string             `json:"contactName"`
+	ContactInfo    string             `json:"contactInfo"`
+	Source         string             `json:"source"`
+	Category       string             `json:"category"`
+	Priority       string             `json:"priority"`
+	AttachmentNote string             `json:"attachmentNote"`
+	OrderNumber    string             `json:"orderNumber"`
+	Status         string             `json:"status"`
+	Assignee       string             `json:"assignee"`
+	CreatedAt      string             `json:"createdAt"`
+	UpdatedAt      string             `json:"updatedAt"`
+	Assignments    []assignmentRecord `json:"assignments"`
 }
 
-// storeFile 是磁盘上的持久化结构。submitIds 与 tickets 按位置一一对应。
+// assignmentRecord 是一次分派或转交记录，保存原负责人、新负责人与发生时间。
+type assignmentRecord struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	At   string `json:"at"`
+}
+
+// assignmentInput 是分派接口接收的字段，全部按文字处理。
+type assignmentInput struct {
+	Assignee    string `json:"assignee"`
+	OperationID string `json:"operationId"`
+}
+
+// storeFile 是磁盘上的持久化结构。submitIds 与 tickets 按位置一一对应；
+// opIds 按工单编号保存每张工单已成功的分派操作标识及其负责人。
 type storeFile struct {
-	Seq       int      `json:"seq"`
-	Tickets   []ticket `json:"tickets"`
-	SubmitIDs []string `json:"submitIds"`
+	Seq       int                          `json:"seq"`
+	Tickets   []ticket                     `json:"tickets"`
+	SubmitIDs []string                     `json:"submitIds"`
+	OpIDs     map[string]map[string]string `json:"opIds"`
 }
 
-// ticketStore 持久化工单与已成功的提交标识，所有方法并发安全。
+// ticketStore 持久化工单、已成功的提交标识与分派操作标识，所有方法并发安全。
 type ticketStore struct {
 	mu       sync.Mutex
 	path     string
 	seq      int
 	tickets  []ticket
-	bySubmit map[string]int // submitId -> tickets 下标
+	bySubmit map[string]int               // submitId -> tickets 下标
+	byID     map[string]int               // 工单编号 -> tickets 下标
+	opIDs    map[string]map[string]string // 工单编号 -> operationId -> 成功提交时的负责人
 }
 
 func loadStore(path string) (*ticketStore, error) {
-	s := &ticketStore{path: path, tickets: []ticket{}, bySubmit: map[string]int{}}
+	s := &ticketStore{
+		path:     path,
+		tickets:  []ticket{},
+		bySubmit: map[string]int{},
+		byID:     map[string]int{},
+		opIDs:    map[string]map[string]string{},
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -97,11 +121,19 @@ func loadStore(path string) (*ticketStore, error) {
 		s.tickets = data.Tickets
 	}
 	s.seq = data.Seq
+	if data.OpIDs != nil {
+		s.opIDs = data.OpIDs
+	}
 	for i, t := range s.tickets {
 		// 编号是重启后不重复的最终依据；旧数据缺少 seq 时从编号恢复。
 		var n int
 		if _, scanErr := fmt.Sscanf(t.ID, "TKT-%d", &n); scanErr == nil && n > s.seq {
 			s.seq = n
+		}
+		s.byID[t.ID] = i
+		if t.Assignments == nil {
+			// 已有工单没有分派记录时展示为空，不补造历史。
+			s.tickets[i].Assignments = []assignmentRecord{}
 		}
 		if i < len(data.SubmitIDs) && data.SubmitIDs[i] != "" {
 			s.bySubmit[data.SubmitIDs[i]] = i
@@ -118,7 +150,7 @@ func (s *ticketStore) persistLocked() error {
 			ids[i] = id
 		}
 	}
-	data := storeFile{Seq: s.seq, Tickets: s.tickets, SubmitIDs: ids}
+	data := storeFile{Seq: s.seq, Tickets: s.tickets, SubmitIDs: ids, OpIDs: s.opIDs}
 	buf, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
@@ -132,6 +164,8 @@ func (s *ticketStore) persistLocked() error {
 }
 
 var errConflict = errors.New("submit id reused with different content")
+var errNotFound = errors.New("ticket not found")
+var errOpConflict = errors.New("operation id reused with different assignee")
 
 // create 校验后的数据登记为工单。同一提交标识、相同内容为幂等重放，
 // 返回已有工单且 replay=true；同一标识不同内容返回 errConflict 且不改数据。
@@ -161,12 +195,15 @@ func (s *ticketStore) create(in ticketInput) (t ticket, replay bool, err error) 
 		Assignee:       "未分派",
 		CreatedAt:      now,
 		UpdatedAt:      now,
+		Assignments:    []assignmentRecord{},
 	}
 	s.tickets = append(s.tickets, t)
 	s.bySubmit[in.SubmitID] = len(s.tickets) - 1
+	s.byID[t.ID] = len(s.tickets) - 1
 	if err := s.persistLocked(); err != nil {
 		// 保存失败：回滚内存中的本次变更，登记不算完成。
 		delete(s.bySubmit, in.SubmitID)
+		delete(s.byID, t.ID)
 		s.tickets = s.tickets[:len(s.tickets)-1]
 		s.seq--
 		return ticket{}, false, err
@@ -174,7 +211,58 @@ func (s *ticketStore) create(in ticketInput) (t ticket, replay bool, err error) 
 	return t, false, nil
 }
 
-// list 返回按创建时间从新到旧排列的工单副本。
+// assign 处理一次分派或转交。负责人与当前相同、或操作标识已成功提交过相同负责人时
+// 为幂等成功，不改动负责人、时间与记录；操作标识已成功提交过不同负责人时返回
+// errOpConflict 且不改动任何内容；工单不存在时返回 errNotFound。
+func (s *ticketStore) assign(ticketID, assignee, opID string) (t ticket, changed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, ok := s.byID[ticketID]
+	if !ok {
+		return ticket{}, false, errNotFound
+	}
+	opMap, hadMap := s.opIDs[ticketID]
+	if !hadMap {
+		opMap = map[string]string{}
+	}
+	if prev, seen := opMap[opID]; seen {
+		// 同一操作标识已成功提交过：负责人相同即返回成功，不再修改负责人、
+		// 时间或记录；即使工单后来已转交给别人，重试旧操作也不能把负责人改回去。
+		if prev == assignee {
+			return s.tickets[idx], false, nil
+		}
+		return ticket{}, false, errOpConflict
+	}
+
+	cur := s.tickets[idx]
+	updated := cur
+	if cur.Assignee != assignee {
+		// 实际变化才追加分派记录，并刷新最近处理时间；登记内容与编号等保持不变。
+		updated.Assignee = assignee
+		updated.UpdatedAt = time.Now().Format(timeLayout)
+		updated.Assignments = append(append([]assignmentRecord(nil), cur.Assignments...), assignmentRecord{
+			From: cur.Assignee,
+			To:   assignee,
+			At:   updated.UpdatedAt,
+		})
+		changed = true
+	}
+	opMap[opID] = assignee
+	if !hadMap {
+		s.opIDs[ticketID] = opMap
+	}
+	s.tickets[idx] = updated
+	if err := s.persistLocked(); err != nil {
+		// 保存失败：回滚内存中的本次变更，操作标识不算成功，修正后可重试。
+		s.tickets[idx] = cur
+		delete(opMap, opID)
+		if !hadMap {
+			delete(s.opIDs, ticketID)
+		}
+		return ticket{}, false, err
+	}
+	return updated, changed, nil
+}
 func (s *ticketStore) list() []ticket {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -299,7 +387,12 @@ func run() error {
 	}
 	dataFile := filepath.Join(*data, "tickets.json")
 	if _, err := os.Stat(dataFile); errors.Is(err, os.ErrNotExist) {
-		buf, err := json.MarshalIndent(storeFile{Seq: 0, Tickets: []ticket{}, SubmitIDs: []string{}}, "", "  ")
+		buf, err := json.MarshalIndent(storeFile{
+			Seq:       0,
+			Tickets:   []ticket{},
+			SubmitIDs: []string{},
+			OpIDs:     map[string]map[string]string{},
+		}, "", "  ")
 		if err != nil {
 			return err
 		}
@@ -381,6 +474,56 @@ func run() error {
 		default:
 			respond(w, http.StatusMethodNotAllowed, "GET, POST", map[string]string{"error": "method not allowed"})
 		}
+	})
+	mux.HandleFunc("POST /api/tickets/{id}/assignment", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": "unable to read request body"})
+			return
+		}
+		dec := json.NewDecoder(bytes.NewReader(body))
+		var in assignmentInput
+		if decErr := dec.Decode(&in); decErr != nil {
+			if errors.Is(decErr, io.EOF) {
+				decErr = errors.New("request body is empty")
+			}
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": "invalid JSON: " + decErr.Error()})
+			return
+		}
+		var tail json.RawMessage
+		if decErr := dec.Decode(&tail); !errors.Is(decErr, io.EOF) {
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": "invalid JSON: trailing data after the JSON object"})
+			return
+		}
+		assignee := strings.TrimSpace(in.Assignee)
+		opID := strings.TrimSpace(in.OperationID)
+		if assignee == "" {
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": "assignee must not be empty"})
+			return
+		}
+		if assignee == "未分派" {
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": `assignee cannot be "未分派"`})
+			return
+		}
+		if opID == "" {
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": "operationId must not be empty"})
+			return
+		}
+		t, changed, err := store.assign(id, assignee, opID)
+		if errors.Is(err, errNotFound) {
+			respond(w, http.StatusNotFound, "", map[string]string{"error": "ticket not found: " + id})
+			return
+		}
+		if errors.Is(err, errOpConflict) {
+			respond(w, http.StatusConflict, "", map[string]string{"error": "operationId was already used with a different assignee"})
+			return
+		}
+		if err != nil {
+			respond(w, http.StatusInternalServerError, "", map[string]string{"error": "unable to save assignment"})
+			return
+		}
+		respond(w, http.StatusOK, "", map[string]any{"ticket": t, "changed": changed})
 	})
 
 	server := &http.Server{

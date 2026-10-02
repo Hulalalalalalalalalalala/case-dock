@@ -42,6 +42,10 @@ dt{font-weight:600;color:#52606d}
 dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
 .close{float:right}
 .tag{display:inline-block;padding:.05rem .5rem;border-radius:1rem;background:#eef2f6;font-size:.85rem}
+.assign{margin-top:1.2rem;border-top:1px solid #d8dee4;padding-top:.8rem}
+.assign h4{margin:.6rem 0 .4rem;font-size:1rem}
+.assign .actions{margin-top:.6rem}
+#assign-notice{margin-top:.6rem}
 .prio-紧急{background:#fdecea;color:#a6372d}
 .prio-高{background:#fdf2e3;color:#9a5b13}
 .prio-普通{background:#eef2f6;color:#33414e}
@@ -292,6 +296,26 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   function row(k, v){
     return '<dt>' + escapeHtml(k) + '</dt><dd class="dd-' + k + '"></dd>';
   }
+
+  // 本次分派操作的标识：与登记标识相互独立。未成功时保持不变，可修正后重试；
+  // 成功后或关闭详情后重新打开时重新生成。
+  var assignOpId = null;
+  function renderAssignments(t){
+    var box = document.getElementById("assign-records");
+    if (!box) return;
+    if (!t.assignments || !t.assignments.length) {
+      box.innerHTML = '<p class="empty">暂无分派记录。</p>';
+      return;
+    }
+    var html = '<table><thead><tr><th>原负责人</th><th>新负责人</th><th>发生时间</th></tr></thead><tbody>';
+    t.assignments.forEach(function(rec){
+      html += "<tr><td>" + escapeHtml(rec.from) + "</td><td>" +
+        escapeHtml(rec.to) + "</td><td>" + escapeHtml(fmtTime(rec.at)) + "</td></tr>";
+    });
+    html += "</tbody></table>";
+    box.innerHTML = html;
+  }
+
   function showDetail(t){
     detail.innerHTML =
       '<button type="button" class="secondary close">关闭</button>' +
@@ -301,7 +325,18 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       row("问题描述","description") + row("联系人","contactName") + row("联系方式","contactInfo") +
       row("关联订单号","orderNumber") + row("附件说明","attachmentNote") +
       row("创建时间","createdAt") + row("最近处理时间","updatedAt") +
-      "</dl>";
+      "</dl>" +
+      '<div class="assign">' +
+      "<h4>分派 / 转交</h4>" +
+      '<form id="assign-form" novalidate>' +
+      '<label for="f-assignee">负责人 <span class="req">*</span></label>' +
+      '<input type="text" id="f-assignee" placeholder="填写负责人姓名，不能填写“未分派”">' +
+      '<div class="actions"><button type="submit" id="assign-btn">提交分派</button></div>' +
+      '<div id="assign-notice" class="notice" role="alert"></div>' +
+      "</form>" +
+      "<h4>分派记录</h4>" +
+      '<div id="assign-records"></div>' +
+      "</div>";
     var map = {
       "编号": t.id, "状态": t.status, "负责人": t.assignee,
       "优先级": t.priority, "来源": t.source, "类别": t.category,
@@ -314,6 +349,10 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       // 以文本节点写入，换行由 CSS white-space:pre-wrap 保留
       dts[i].nextElementSibling.textContent = map[dts[i].textContent];
     }
+    var assigneeInput = document.getElementById("f-assignee");
+    assigneeInput.value = (t.assignee && t.assignee !== "未分派") ? t.assignee : "";
+    assignOpId = newSubmitId();
+    renderAssignments(t);
     detail.classList.add("open");
     detail.setAttribute("aria-hidden","false");
     detail.scrollIntoView({behavior:"smooth", block:"nearest"});
@@ -323,6 +362,76 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       detail.classList.remove("open");
       detail.setAttribute("aria-hidden","true");
     }
+  });
+
+  // 分派 / 转交提交：首次分派与后续转交都走这一操作。
+  detail.addEventListener("submit", function(ev){
+    if (ev.target.id !== "assign-form") return;
+    ev.preventDefault();
+    var current = null;
+    for (var i=0;i<loaded.length;i++){
+      if (loaded[i].id === detail.querySelector(".dd-id").textContent) { current = loaded[i]; break; }
+    }
+    if (!current) return;
+    var input = document.getElementById("f-assignee");
+    var btn = document.getElementById("assign-btn");
+    var notice = document.getElementById("assign-notice");
+    notice.className = "notice";
+    notice.textContent = ""; // 以文本节点显示
+    var assignee = input.value.trim();
+    if (!assignee) {
+      notice.className = "notice err";
+      notice.textContent = "请填写负责人姓名，不能为空。";
+      return;
+    }
+    if (assignee === "未分派") {
+      notice.className = "notice err";
+      notice.textContent = '负责人不能填写“未分派”，请填写实际负责人姓名。';
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "正在分派…";
+    fetch("/api/tickets/" + encodeURIComponent(current.id) + "/assignment", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({assignee: assignee, operationId: assignOpId})
+    }).then(function(resp){
+      return resp.json().catch(function(){ return {}; }).then(function(data){
+        return {status: resp.status, data: data};
+      });
+    }).then(function(r){
+      if (r.status === 200 && r.data && r.data.ticket) {
+        var updated = r.data.ticket;
+        for (var j=0;j<loaded.length;j++){
+          if (loaded[j].id === updated.id) { loaded[j] = updated; break; }
+        }
+        renderList();
+        showDetail(updated);
+        var ok = document.getElementById("assign-notice");
+        ok.className = "notice ok";
+        ok.textContent = r.data.changed ? "分派成功，负责人已更新。" : "负责人未变化。";
+      } else if (r.status === 400) {
+        notice.className = "notice err";
+        notice.textContent = "输入错误：" + (r.data.error || "负责人或操作标识不正确") +
+          "\n填写内容已保留，请修改后重试。";
+      } else if (r.status === 404) {
+        notice.className = "notice err";
+        notice.textContent = "工单不存在（" + current.id + "），可能已被删除。";
+      } else if (r.status === 409) {
+        notice.className = "notice err";
+        notice.textContent = "操作标识冲突：该标识已用不同负责人成功提交过，本次未改动。";
+      } else {
+        notice.className = "notice err";
+        notice.textContent = "分派失败（HTTP " + r.status + "）：" + (r.data.error || "未知错误") +
+          "\n填写内容已保留，请稍后重试。";
+      }
+    }).catch(function(){
+      notice.className = "notice err";
+      notice.textContent = "分派失败：无法连接服务。填写内容已保留，请稍后重试。";
+    }).finally(function(){
+      btn.disabled = false;
+      btn.textContent = "提交分派";
+    });
   });
 
   function loadTickets(){
