@@ -45,21 +45,38 @@ type ticketInput struct {
 	SubmitID       string `json:"submitId"`
 }
 
+// unassigned 是登记后尚未分派时的负责人占位文字，不能作为负责人填写。
+const unassigned = "未分派"
+
+// assignmentInput 是分派接口接收的字段，负责人按文字处理。
+type assignmentInput struct {
+	Assignee    string `json:"assignee"`
+	OperationID string `json:"operationId"`
+}
+
+// assignment 是一次负责人实际变化的分派记录。
+type assignment struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	At   string `json:"at"`
+}
+
 // ticket 是保存并返回的工单记录。
 type ticket struct {
-	ID             string `json:"id"`
-	Description    string `json:"description"`
-	ContactName    string `json:"contactName"`
-	ContactInfo    string `json:"contactInfo"`
-	Source         string `json:"source"`
-	Category       string `json:"category"`
-	Priority       string `json:"priority"`
-	AttachmentNote string `json:"attachmentNote"`
-	OrderNumber    string `json:"orderNumber"`
-	Status         string `json:"status"`
-	Assignee       string `json:"assignee"`
-	CreatedAt      string `json:"createdAt"`
-	UpdatedAt      string `json:"updatedAt"`
+	ID             string       `json:"id"`
+	Description    string       `json:"description"`
+	ContactName    string       `json:"contactName"`
+	ContactInfo    string       `json:"contactInfo"`
+	Source         string       `json:"source"`
+	Category       string       `json:"category"`
+	Priority       string       `json:"priority"`
+	AttachmentNote string       `json:"attachmentNote"`
+	OrderNumber    string       `json:"orderNumber"`
+	Status         string       `json:"status"`
+	Assignee       string       `json:"assignee"`
+	CreatedAt      string       `json:"createdAt"`
+	UpdatedAt      string       `json:"updatedAt"`
+	Assignments    []assignment `json:"assignments"`
 }
 
 // storeFile 是磁盘上的持久化结构。submitIds 与 tickets 按位置一一对应。
@@ -67,19 +84,23 @@ type storeFile struct {
 	Seq       int      `json:"seq"`
 	Tickets   []ticket `json:"tickets"`
 	SubmitIDs []string `json:"submitIds"`
+	// AssignOperations 记录每张工单已成功的分派操作标识及其负责人：
+	// 工单编号 -> operationId -> 去除首尾空白后的负责人。
+	AssignOperations map[string]map[string]string `json:"assignOperations,omitempty"`
 }
 
 // ticketStore 持久化工单与已成功的提交标识，所有方法并发安全。
 type ticketStore struct {
-	mu       sync.Mutex
-	path     string
-	seq      int
-	tickets  []ticket
-	bySubmit map[string]int // submitId -> tickets 下标
+	mu        sync.Mutex
+	path      string
+	seq       int
+	tickets   []ticket
+	bySubmit  map[string]int               // submitId -> tickets 下标
+	assignOps map[string]map[string]string // 工单编号 -> operationId -> assignee
 }
 
 func loadStore(path string) (*ticketStore, error) {
-	s := &ticketStore{path: path, tickets: []ticket{}, bySubmit: map[string]int{}}
+	s := &ticketStore{path: path, tickets: []ticket{}, bySubmit: map[string]int{}, assignOps: map[string]map[string]string{}}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -107,6 +128,11 @@ func loadStore(path string) (*ticketStore, error) {
 			s.bySubmit[data.SubmitIDs[i]] = i
 		}
 	}
+	for id, ops := range data.AssignOperations {
+		if len(ops) > 0 {
+			s.assignOps[id] = ops
+		}
+	}
 	return s, nil
 }
 
@@ -118,7 +144,7 @@ func (s *ticketStore) persistLocked() error {
 			ids[i] = id
 		}
 	}
-	data := storeFile{Seq: s.seq, Tickets: s.tickets, SubmitIDs: ids}
+	data := storeFile{Seq: s.seq, Tickets: s.tickets, SubmitIDs: ids, AssignOperations: s.assignOps}
 	buf, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
@@ -158,7 +184,7 @@ func (s *ticketStore) create(in ticketInput) (t ticket, replay bool, err error) 
 		AttachmentNote: in.AttachmentNote,
 		OrderNumber:    in.OrderNumber,
 		Status:         "待处理",
-		Assignee:       "未分派",
+		Assignee:       unassigned,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
@@ -172,6 +198,66 @@ func (s *ticketStore) create(in ticketInput) (t ticket, replay bool, err error) 
 		return ticket{}, false, err
 	}
 	return t, false, nil
+}
+
+var errNotFound = errors.New("ticket not found")
+var errAssignConflict = errors.New("operation id reused with a different assignee")
+
+// assign 将工单负责人分派或转交给 in.Assignee。changed 表示负责人是否实际变化。
+// 同一工单内同一操作标识：提交相同负责人为幂等重放，返回当前工单且不做任何修改
+// （即使工单后来已转交给别人，也不会被改回）；提交不同负责人返回 errAssignConflict。
+// 负责人与当前相同视为成功但不追加记录、不刷新最近处理时间，操作标识仍会记录。
+func (s *ticketStore) assign(id string, in assignmentInput) (t ticket, changed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := -1
+	for i, tk := range s.tickets {
+		if tk.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return ticket{}, false, errNotFound
+	}
+	ops := s.assignOps[id]
+	if prev, ok := ops[in.OperationID]; ok {
+		if prev == in.Assignee {
+			// 幂等重放：返回当前工单，不修改负责人、时间或记录。
+			return s.tickets[idx], false, nil
+		}
+		return ticket{}, false, errAssignConflict
+	}
+	if ops == nil {
+		ops = map[string]string{}
+	}
+	ops[in.OperationID] = in.Assignee
+
+	cur := s.tickets[idx]
+	if cur.Assignee == in.Assignee {
+		// 负责人未变化：只记录操作标识，不追加分派记录、不刷新最近处理时间。
+		s.assignOps[id] = ops
+		if err := s.persistLocked(); err != nil {
+			delete(ops, in.OperationID)
+			return ticket{}, false, err
+		}
+		return cur, false, nil
+	}
+
+	now := time.Now().Format(timeLayout)
+	updated := cur
+	updated.Assignments = append(append([]assignment{}, cur.Assignments...), assignment{From: cur.Assignee, To: in.Assignee, At: now})
+	updated.Assignee = in.Assignee
+	updated.UpdatedAt = now
+	s.tickets[idx] = updated
+	s.assignOps[id] = ops
+	if err := s.persistLocked(); err != nil {
+		// 保存失败：回滚内存中的本次变更，分派不算完成。
+		delete(ops, in.OperationID)
+		s.tickets[idx] = cur
+		return ticket{}, false, err
+	}
+	return updated, true, nil
 }
 
 // list 返回按创建时间从新到旧排列的工单副本。
@@ -235,6 +321,23 @@ func validateInput(in *ticketInput) error {
 	}
 	if !oneOf(in.Priority, validPriorities) {
 		return fmt.Errorf("invalid priority: %q; allowed: %s", in.Priority, strings.Join(validPriorities, "/"))
+	}
+	return nil
+}
+
+// validateAssignment 校验分派请求，并对文字字段去除首尾空白。
+// 负责人去空白后必须有内容，且不能是占位文字“未分派”；操作标识必须非空。
+func validateAssignment(in *assignmentInput) error {
+	in.Assignee = strings.TrimSpace(in.Assignee)
+	in.OperationID = strings.TrimSpace(in.OperationID)
+	if in.Assignee == "" {
+		return errors.New("missing or empty required field: assignee")
+	}
+	if in.Assignee == unassigned {
+		return fmt.Errorf("invalid assignee: %q is reserved and cannot be used", unassigned)
+	}
+	if in.OperationID == "" {
+		return errors.New("missing or empty required field: operationId")
 	}
 	return nil
 }
@@ -381,6 +484,50 @@ func run() error {
 		default:
 			respond(w, http.StatusMethodNotAllowed, "GET, POST", map[string]string{"error": "method not allowed"})
 		}
+	})
+	mux.HandleFunc("/api/tickets/{id}/assignment", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			respond(w, http.StatusMethodNotAllowed, "POST", map[string]string{"error": "method not allowed"})
+			return
+		}
+		id := r.PathValue("id")
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": "unable to read request body"})
+			return
+		}
+		dec := json.NewDecoder(bytes.NewReader(body))
+		var in assignmentInput
+		if decErr := dec.Decode(&in); decErr != nil {
+			if errors.Is(decErr, io.EOF) {
+				decErr = errors.New("request body is empty")
+			}
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": "invalid JSON: " + decErr.Error()})
+			return
+		}
+		var tail json.RawMessage
+		if decErr := dec.Decode(&tail); !errors.Is(decErr, io.EOF) {
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": "invalid JSON: trailing data after the JSON object"})
+			return
+		}
+		if err := validateAssignment(&in); err != nil {
+			respond(w, http.StatusBadRequest, "", map[string]string{"error": err.Error()})
+			return
+		}
+		t, changed, err := store.assign(id, in)
+		if errors.Is(err, errNotFound) {
+			respond(w, http.StatusNotFound, "", map[string]string{"error": "ticket not found: " + id})
+			return
+		}
+		if errors.Is(err, errAssignConflict) {
+			respond(w, http.StatusConflict, "", map[string]string{"error": "operation id was already used with a different assignee"})
+			return
+		}
+		if err != nil {
+			respond(w, http.StatusInternalServerError, "", map[string]string{"error": "unable to save assignment"})
+			return
+		}
+		respond(w, http.StatusOK, "", map[string]any{"ticket": t, "changed": changed})
 	})
 
 	server := &http.Server{

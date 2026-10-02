@@ -41,6 +41,11 @@ dl{display:grid;grid-template-columns:7rem 1fr;gap:.35rem .8rem;margin:0}
 dt{font-weight:600;color:#52606d}
 dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
 .close{float:right}
+.dialog h4{font-size:1rem;margin:1.2rem 0 .4rem}
+.assign-list{margin:.2rem 0;padding-left:1.2rem}
+.assign-list li{margin:.15rem 0}
+.assign-time{color:#6b7280;font-size:.85rem}
+#assign-form{margin-top:.3rem}
 .tag{display:inline-block;padding:.05rem .5rem;border-radius:1rem;background:#eef2f6;font-size:.85rem}
 .prio-紧急{background:#fdecea;color:#a6372d}
 .prio-高{background:#fdf2e3;color:#9a5b13}
@@ -289,19 +294,47 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     showDetail(loaded[Number(btn.getAttribute("data-i"))]);
   });
 
-  function row(k, v){
-    return '<dt>' + escapeHtml(k) + '</dt><dd class="dd-' + k + '"></dd>';
+  function row(k){
+    return '<dt>' + escapeHtml(k) + '</dt><dd></dd>';
   }
+  var current = null;    // 详情中正在查看的工单
+  var assignOpId = null; // 本次分派操作的标识：未成功时保持不变可重试，成功后重新生成
+
+  function setAssignNotice(kind, text){
+    var n = document.getElementById("assign-notice");
+    if (!n) return;
+    n.className = "notice " + kind;
+    n.textContent = text; // 以文本节点显示，不执行其中的页面代码
+  }
+
   function showDetail(t){
+    current = t;
+    assignOpId = newSubmitId(); // 每次打开详情开始一次新的分派操作
     detail.innerHTML =
       '<button type="button" class="secondary close">关闭</button>' +
       "<h3>工单详情</h3><dl>" +
-      row("编号","id") + row("状态","status") + row("负责人","assignee") +
-      row("优先级","priority") + row("来源","source") + row("类别","category") +
-      row("问题描述","description") + row("联系人","contactName") + row("联系方式","contactInfo") +
-      row("关联订单号","orderNumber") + row("附件说明","attachmentNote") +
-      row("创建时间","createdAt") + row("最近处理时间","updatedAt") +
-      "</dl>";
+      row("编号") + row("状态") + row("负责人") +
+      row("优先级") + row("来源") + row("类别") +
+      row("问题描述") + row("联系人") + row("联系方式") +
+      row("关联订单号") + row("附件说明") +
+      row("创建时间") + row("最近处理时间") +
+      "</dl>" +
+      "<h4>分派记录</h4>" +
+      '<div class="assign-history"></div>' +
+      "<h4>分派负责人</h4>" +
+      '<form id="assign-form" novalidate>' +
+      '<input type="text" id="f-assignee" placeholder="填写负责人姓名" autocomplete="off">' +
+      '<div class="actions"><button type="submit" id="assign-btn">提交分派</button></div>' +
+      '<div id="assign-notice" class="notice" role="alert"></div>' +
+      "</form>";
+    fillDetail(t);
+    detail.classList.add("open");
+    detail.setAttribute("aria-hidden","false");
+    detail.scrollIntoView({behavior:"smooth", block:"nearest"});
+  }
+
+  // fillDetail 只更新详情中的取值与分派记录，不动分派表单与提示。
+  function fillDetail(t){
     var map = {
       "编号": t.id, "状态": t.status, "负责人": t.assignee,
       "优先级": t.priority, "来源": t.source, "类别": t.category,
@@ -309,15 +342,84 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       "关联订单号": t.orderNumber || "（无）", "附件说明": t.attachmentNote || "（无）",
       "创建时间": fmtTime(t.createdAt), "最近处理时间": fmtTime(t.updatedAt)
     };
-    var dts = detail.querySelectorAll("dt");
+    var dts = detail.querySelectorAll("dl dt");
     for (var i=0;i<dts.length;i++){
       // 以文本节点写入，换行由 CSS white-space:pre-wrap 保留
       dts[i].nextElementSibling.textContent = map[dts[i].textContent];
     }
-    detail.classList.add("open");
-    detail.setAttribute("aria-hidden","false");
-    detail.scrollIntoView({behavior:"smooth", block:"nearest"});
+    var hist = detail.querySelector(".assign-history");
+    var recs = Array.isArray(t.assignments) ? t.assignments : [];
+    if (!recs.length) {
+      hist.innerHTML = '<p class="empty">暂无分派记录。</p>';
+      return;
+    }
+    var html = '<ul class="assign-list">';
+    recs.forEach(function(rec){ // 按发生顺序展示，姓名按普通文字显示
+      html += "<li>" + escapeHtml(rec.from) + " → " + escapeHtml(rec.to) +
+        ' <span class="assign-time">' + escapeHtml(fmtTime(rec.at)) + "</span></li>";
+    });
+    html += "</ul>";
+    hist.innerHTML = html;
   }
+
+  detail.addEventListener("submit", function(ev){
+    if (!ev.target || ev.target.id !== "assign-form") return;
+    ev.preventDefault();
+    if (!current) return;
+    var input = document.getElementById("f-assignee");
+    var btn = document.getElementById("assign-btn");
+    var assignee = input.value.trim();
+    if (!assignee) {
+      setAssignNotice("err", "请填写负责人。");
+      return;
+    }
+    if (assignee === "未分派") {
+      setAssignNotice("err", "负责人不能填写“未分派”。");
+      return;
+    }
+    setAssignNotice("", "");
+    btn.disabled = true;
+    btn.textContent = "正在分派…";
+    fetch("/api/tickets/" + encodeURIComponent(current.id) + "/assignment", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({assignee: assignee, operationId: assignOpId})
+    }).then(function(resp){
+      return resp.json().catch(function(){ return {}; }).then(function(data){
+        return {status: resp.status, data: data};
+      });
+    }).then(function(r){
+      if (r.status === 200 && r.data && r.data.ticket) {
+        var nt = r.data.ticket;
+        for (var i=0;i<loaded.length;i++){ // 列表立即显示新负责人与本次处理时间
+          if (loaded[i].id === nt.id) { loaded[i] = nt; break; }
+        }
+        renderList();
+        current = nt;
+        fillDetail(nt);
+        assignOpId = newSubmitId(); // 本次操作已成功，下一次分派使用新标识
+        input.value = "";
+        setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+      } else if (r.status === 400) {
+        setAssignNotice("err", "输入错误：" + (r.data.error || "请检查填写内容") +
+          "\n填写内容已保留，可修改后重试。");
+      } else if (r.status === 404) {
+        setAssignNotice("err", "工单不存在：" + (r.data.error || current.id) +
+          "\n请刷新列表后重试。");
+      } else if (r.status === 409) {
+        setAssignNotice("err", "操作标识冲突：" + (r.data.error || "同一操作标识对应了不同负责人") +
+          "\n记录未改动。请关闭详情后重新打开再分派。");
+      } else {
+        setAssignNotice("err", "分派失败（HTTP " + r.status + "）：" + (r.data.error || "未知错误") +
+          "\n填写内容已保留，请重试。");
+      }
+    }).catch(function(){
+      setAssignNotice("err", "分派失败：无法连接服务。填写内容已保留，请稍后重试。");
+    }).finally(function(){
+      btn.disabled = false;
+      btn.textContent = "提交分派";
+    });
+  });
   detail.addEventListener("click", function(ev){
     if (ev.target.classList.contains("close")) {
       detail.classList.remove("open");
