@@ -297,8 +297,9 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   function row(k){
     return '<dt>' + escapeHtml(k) + '</dt><dd></dd>';
   }
-  var current = null;    // 详情中正在查看的工单
-  var assignOpId = null; // 本次分派操作的标识：未成功时保持不变可重试，成功后重新生成
+  var current = null;      // 详情中正在查看的工单
+  var assignOpId = null;   // 当前详情本次分派操作的标识：未成功时保持不变可重试，成功后重新生成
+  var assignPending = {};  // 工单编号 -> 等待结果的分派请求数，结果只归属于提交时的工单
 
   function setAssignNotice(kind, text){
     var n = document.getElementById("assign-notice");
@@ -328,6 +329,12 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       '<div id="assign-notice" class="notice" role="alert"></div>' +
       "</form>";
     fillDetail(t);
+    if (assignPending[t.id]) {
+      // 重新打开时该工单仍有分派在等待结果，保持提交中的按钮状态
+      var pendingBtn = document.getElementById("assign-btn");
+      pendingBtn.disabled = true;
+      pendingBtn.textContent = "正在分派…";
+    }
     detail.classList.add("open");
     detail.setAttribute("aria-hidden","false");
     detail.scrollIntoView({behavior:"smooth", block:"nearest"});
@@ -377,13 +384,23 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       setAssignNotice("err", "负责人不能填写“未分派”。");
       return;
     }
+    // 结果只归属于提交时的工单：编号与操作标识在提交时固定，
+    // 之后关闭详情或查看其他工单都不改变本次请求的去向与结果的归属。
+    var ticketId = current.id;
+    var opId = assignOpId;
     setAssignNotice("", "");
     btn.disabled = true;
     btn.textContent = "正在分派…";
-    fetch("/api/tickets/" + encodeURIComponent(current.id) + "/assignment", {
+    assignPending[ticketId] = (assignPending[ticketId] || 0) + 1;
+    // 只有详情仍打开且仍在查看提交时的工单，结果才能更新详情、表单与按钮；
+    // 否则结果只落到列表数据上，不打扰当前正在查看或填写的另一张工单。
+    function viewingThis(){
+      return detail.classList.contains("open") && current && current.id === ticketId;
+    }
+    fetch("/api/tickets/" + encodeURIComponent(ticketId) + "/assignment", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({assignee: assignee, operationId: assignOpId})
+      body: JSON.stringify({assignee: assignee, operationId: opId})
     }).then(function(resp){
       return resp.json().catch(function(){ return {}; }).then(function(data){
         return {status: resp.status, data: data};
@@ -395,16 +412,19 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
           if (loaded[i].id === nt.id) { loaded[i] = nt; break; }
         }
         renderList();
+        if (!viewingThis()) return; // 已关闭或切换查看对象：详情保持原样
         current = nt;
         fillDetail(nt);
         assignOpId = newSubmitId(); // 本次操作已成功，下一次分派使用新标识
-        input.value = "";
+        document.getElementById("f-assignee").value = "";
         setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+      } else if (!viewingThis()) {
+        return; // 失败提示只属于提交时的工单，不覆盖另一张工单的提示
       } else if (r.status === 400) {
         setAssignNotice("err", "输入错误：" + (r.data.error || "请检查填写内容") +
           "\n填写内容已保留，可修改后重试。");
       } else if (r.status === 404) {
-        setAssignNotice("err", "工单不存在：" + (r.data.error || current.id) +
+        setAssignNotice("err", "工单不存在：" + (r.data.error || ticketId) +
           "\n请刷新列表后重试。");
       } else if (r.status === 409) {
         setAssignNotice("err", "操作标识冲突：" + (r.data.error || "同一操作标识对应了不同负责人") +
@@ -414,10 +434,17 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
           "\n填写内容已保留，请重试。");
       }
     }).catch(function(){
+      if (!viewingThis()) return;
       setAssignNotice("err", "分派失败：无法连接服务。填写内容已保留，请稍后重试。");
     }).finally(function(){
-      btn.disabled = false;
-      btn.textContent = "提交分派";
+      assignPending[ticketId] -= 1;
+      if (assignPending[ticketId] <= 0) delete assignPending[ticketId];
+      if (!viewingThis() || assignPending[ticketId]) return; // 不解除其他工单自己等待结果的状态
+      var b = document.getElementById("assign-btn");
+      if (b) {
+        b.disabled = false;
+        b.textContent = "提交分派";
+      }
     });
   });
   detail.addEventListener("click", function(ev){
