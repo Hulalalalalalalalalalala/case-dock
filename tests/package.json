@@ -1,0 +1,13 @@
+{
+  "name": "casedock-regression-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "工单分派草稿保留的浏览器端到端回归测试",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}
