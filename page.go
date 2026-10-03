@@ -144,6 +144,10 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   // 本次登记的提交标识：未成功时保持不变，可修正内容后重试；
   // 成功后或用户主动开始新登记时重新生成。
   var submitId = newSubmitId();
+  // 登记版本：每次“清空重填”递增。提交时记下当时的版本，
+  // 请求结束时版本已变，说明等待期间用户开始了另一份登记，
+  // 该结果只属于清空重填之前的那次提交，不能改动当前表单。
+  var draftVersion = 0;
   function newSubmitId(){
     if (window.crypto && window.crypto.getRandomValues) {
       var b = new Uint8Array(16);
@@ -203,6 +207,12 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       return;
     }
     submitBtn.disabled = true;
+    // 结果只归属于提交时的这份登记：版本在提交时固定，等待期间
+    // 用户“清空重填”会使版本变化，结果不得清空或改动新登记的内容。
+    var submittedVersion = draftVersion;
+    function draftReplaced(){
+      return draftVersion !== submittedVersion;
+    }
     fetch("/api/tickets", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
@@ -212,6 +222,29 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         return {status: resp.status, data: data};
       });
     }).then(function(r){
+      if (draftReplaced()) {
+        // 等待期间用户已清空重填：结果属于清空重填之前的那次提交，
+        // 只提示与更新列表，不清空、不填回、不改动当前新登记。
+        if (r.status === 200 || r.status === 201) {
+          var staleMsg = "清空重填之前的那次提交已登记成功，工单编号：" + r.data.id +
+            "。\n当前这份登记尚未提交，填写内容已保留。";
+          if (r.status === 200) {
+            staleMsg = "清空重填之前的那次提交此前已登记成功，返回原工单，编号：" + r.data.id +
+              "。\n当前这份登记尚未提交，填写内容已保留。";
+          }
+          setNotice("ok", staleMsg);
+          loadTickets(); // 旧提交成功的工单仍应进入列表
+        } else if (r.status === 409) {
+          setNotice("err", "清空重填之前的那次提交出现提交标识冲突：" +
+            (r.data.error || "同一提交标识对应了不同内容") +
+            "\n记录未改动。该冲突与当前这份登记无关，当前内容尚未提交，可继续填写后提交。");
+        } else {
+          setNotice("err", "清空重填之前的那次提交失败（HTTP " + r.status + "）：" +
+            (r.data.error || "未知错误") +
+            "\n该失败与当前这份登记无关，当前内容尚未提交，可继续填写后提交。");
+        }
+        return;
+      }
       if (r.status === 200 || r.status === 201) {
         var msg = "登记成功，新工单编号：" + r.data.id;
         if (r.status === 200) {
@@ -223,14 +256,20 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         loadTickets();
       } else if (r.status === 409) {
         setNotice("err", "提交标识冲突：" + (r.data.error || "同一提交标识对应了不同内容") +
-          "\n记录未改动。可改回原内容重试，或按“开始新登记”生成新标识。");
+          "\n记录未改动。可改回原内容重试，或按“清空重填”开始另一份登记。");
       } else {
         setNotice("err", "登记失败（HTTP " + r.status + "）：" + (r.data.error || "未知错误") +
           "\n填写内容已保留，请修改后重试。");
       }
     }).catch(function(){
+      if (draftReplaced()) {
+        setNotice("err", "清空重填之前的那次提交失败：无法连接服务。" +
+          "\n该失败与当前这份登记无关，当前内容尚未提交，可继续填写后提交。");
+        return;
+      }
       setNotice("err", "登记失败：无法连接服务。填写内容已保留，请稍后重试。");
     }).finally(function(){
+      // 无论结果归属哪份登记，旧请求结束后提交按钮都恢复正常。
       submitBtn.disabled = false;
     });
   });
@@ -239,6 +278,7 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     form.reset();
     clearNotice();
     submitId = newSubmitId(); // 放弃当前未成功的填写，按另一份登记处理
+    draftVersion += 1; // 进行中的旧请求结果不再属于当前这份登记
   });
 
   // ---- 列表与详情 ----
