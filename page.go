@@ -380,6 +380,10 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   var current = null;      // 详情中正在查看的工单
   var assignOpId = null;   // 当前详情本次分派操作的标识：未成功时保持不变可重试，成功后重新生成
   var assignPending = {};  // 工单编号 -> 等待结果的分派请求数，结果只归属于提交时的工单
+  // assignEdited 记录某工单在等待分派结果期间负责人输入框是否被改动过
+  // （含主动清空、仅增删首尾空白）：以标记而非当前取值判断，
+  // 这样“清空后等待”不会被误当成从未编辑。
+  var assignEdited = {};   // 工单编号 -> 等待结果期间输入是否被改动
 
   function setAssignNotice(kind, text){
     var n = document.getElementById("assign-notice");
@@ -409,6 +413,12 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       '<div id="assign-notice" class="notice" role="alert"></div>' +
       "</form>";
     fillDetail(t);
+    // 每次打开详情重置该工单的“等待期间已编辑”标记，并在本次详情的
+    // 输入框上监听改动：等待结果期间的任何编辑只代表下一次操作的草稿。
+    delete assignEdited[t.id];
+    document.getElementById("f-assignee").addEventListener("input", function(){
+      if (assignPending[t.id]) assignEdited[t.id] = true;
+    });
     if (assignPending[t.id]) {
       // 重新打开时该工单仍有分派在等待结果，保持提交中的按钮状态
       var pendingBtn = document.getElementById("assign-btn");
@@ -468,6 +478,8 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     // 之后关闭详情或查看其他工单都不改变本次请求的去向与结果的归属。
     var ticketId = current.id;
     var opId = assignOpId;
+    // 本次分派以点击提交时的负责人为准；重新跟踪等待期间对输入框的改动。
+    assignEdited[ticketId] = false;
     setAssignNotice("", "");
     btn.disabled = true;
     btn.textContent = "正在分派…";
@@ -496,8 +508,25 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         current = nt;
         fillDetail(nt);
         assignOpId = newSubmitId(); // 本次操作已成功，下一次分派使用新标识
-        document.getElementById("f-assignee").value = "";
-        setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+        var fAssignee = document.getElementById("f-assignee");
+        if (assignEdited[ticketId]) {
+          // 等待期间改动过输入（含主动清空、仅改动首尾空白）：不写回本次
+          // 请求的负责人，保留返回时输入框里的当前内容，它属于尚未提交的
+          // 下一次分派；提示先讲清这次实际分派给了谁。
+          var keptMsg = r.data.changed
+            ? "分派成功，本次实际分派给：" + nt.assignee + "。"
+            : "提交的负责人与当前负责人相同，负责人未变化，仍为：" + nt.assignee + "。";
+          if (fAssignee.value.trim() === "") {
+            keptMsg += "\n您在等待结果期间清空了输入框，当前内容为空且尚未提交；按钮已恢复，可重新填写后再分派。";
+          } else {
+            keptMsg += "\n输入框中的当前内容尚未提交，已原样保留（包括首尾空白）；按钮已恢复，请确认后再次提交分派。";
+          }
+          setAssignNotice("ok", keptMsg);
+        } else {
+          // 等待期间没有编辑过：成功后照常清空输入并恢复提交按钮。
+          fAssignee.value = "";
+          setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+        }
       } else if (!viewingThis()) {
         return; // 失败提示只属于提交时的工单，不覆盖另一张工单的提示
       } else if (r.status === 400) {
@@ -509,13 +538,25 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       } else if (r.status === 409) {
         setAssignNotice("err", "操作标识冲突：" + (r.data.error || "同一操作标识对应了不同负责人") +
           "\n记录未改动。请关闭详情后重新打开再分派。");
+      } else if (assignEdited[ticketId]) {
+        // 其他接口错误属于此前发出的那次分派；不能把输入框里后来填写的
+        // 负责人描述成已分派。当前输入原样保留，由用户决定是否再次提交。
+        setAssignNotice("err", "此前提交给“" + assignee + "”的分派失败（HTTP " + r.status + "）：" +
+          (r.data.error || "未知错误") +
+          "\n输入框中尚未提交的内容已原样保留，请确认后再次提交。");
       } else {
         setAssignNotice("err", "分派失败（HTTP " + r.status + "）：" + (r.data.error || "未知错误") +
           "\n填写内容已保留，请重试。");
       }
     }).catch(function(){
       if (!viewingThis()) return;
-      setAssignNotice("err", "分派失败：无法连接服务。填写内容已保留，请稍后重试。");
+      if (assignEdited[ticketId]) {
+        // 断网同样只针对此前发出的请求：当前（含等待期间改动的）输入原样保留。
+        setAssignNotice("err", "此前提交给“" + assignee + "”的分派失败：无法连接服务。" +
+          "输入框中尚未提交的内容已原样保留，请稍后确认后再提交。");
+      } else {
+        setAssignNotice("err", "分派失败：无法连接服务。填写内容已保留，请稍后重试。");
+      }
     }).finally(function(){
       assignPending[ticketId] -= 1;
       if (assignPending[ticketId] <= 0) delete assignPending[ticketId];
