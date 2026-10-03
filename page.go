@@ -202,6 +202,10 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       setNotice("err", result.error); // 校验失败，填写内容原样保留
       return;
     }
+    // 结果只归属于提交时的这份登记：提交标识在提交时固定，
+    // 等待期间用户“清空重填”会更换标识，旧请求返回时据此识别，
+    // 不再清空、填回或改动新登记的内容与提示归属。
+    var submittedId = submitId;
     submitBtn.disabled = true;
     fetch("/api/tickets", {
       method: "POST",
@@ -212,6 +216,27 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         return {status: resp.status, data: data};
       });
     }).then(function(r){
+      if (submittedId !== submitId) {
+        // 等待期间用户已清空重填：结果属于此前那份登记，
+        // 只更新列表并提示旧提交的结果，当前新登记内容原样保留。
+        if (r.status === 200 || r.status === 201) {
+          loadTickets(); // 旧提交成功的工单仍进入列表
+          var staleMsg = "清空重填之前的提交已登记成功，工单编号：" + r.data.id;
+          if (r.status === 200) {
+            staleMsg = "清空重填之前的提交此前已登记成功，返回原工单，编号：" + r.data.id;
+          }
+          setNotice("ok", staleMsg + "。当前新登记内容未受影响。");
+        } else if (r.status === 409) {
+          setNotice("err", "清空重填之前的提交发生提交标识冲突：" +
+            (r.data.error || "同一提交标识对应了不同内容") +
+            "\n该结果不属于当前新登记；当前填写内容未受影响，可继续填写后提交。");
+        } else {
+          setNotice("err", "清空重填之前的提交失败（HTTP " + r.status + "）：" +
+            (r.data.error || "未知错误") +
+            "\n该结果不属于当前新登记；当前填写内容未受影响，可继续填写后提交。");
+        }
+        return;
+      }
       if (r.status === 200 || r.status === 201) {
         var msg = "登记成功，新工单编号：" + r.data.id;
         if (r.status === 200) {
@@ -229,6 +254,12 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
           "\n填写内容已保留，请修改后重试。");
       }
     }).catch(function(){
+      if (submittedId !== submitId) {
+        // 旧请求失败不打扰当前新登记，只说明它属于清空重填之前的提交。
+        setNotice("err", "清空重填之前的提交失败：无法连接服务。" +
+          "\n该结果不属于当前新登记；当前填写内容未受影响，可继续填写后提交。");
+        return;
+      }
       setNotice("err", "登记失败：无法连接服务。填写内容已保留，请稍后重试。");
     }).finally(function(){
       submitBtn.disabled = false;
