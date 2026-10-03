@@ -325,6 +325,10 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   var listArea = document.getElementById("list-area");
   var detail = document.getElementById("detail");
   var loaded = [];
+  // confirmed 保存分派接口已确认成功的工单最新状态（工单编号 -> 工单）。
+  // 列表读取可能始于分派成功之前，其旧响应不得撤回已确认的处理结果：
+  // 合并时同一工单保留最近处理时间较新的一方，读取追平或更新后该记录即可丢弃。
+  var confirmed = {};
 
   function escapeHtml(s){
     return String(s).replace(/[&<>"']/g, function(c){
@@ -500,6 +504,7 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     }).then(function(r){
       if (r.status === 200 && r.data && r.data.ticket) {
         var nt = r.data.ticket;
+        confirmed[nt.id] = nt; // 已确认成功的结果，旧列表响应不得将其退回
         for (var i=0;i<loaded.length;i++){ // 列表立即显示新负责人与本次处理时间
           if (loaded[i].id === nt.id) { loaded[i] = nt; break; }
         }
@@ -583,6 +588,31 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       })
       .then(function(data){
         var arr = Array.isArray(data.tickets) ? data.tickets : [];
+        // 与已确认成功的分派结果合并：本次读取可能始于分派之前，
+        // 其旧内容不能撤回已确认的负责人、最近处理时间与分派记录。
+        // 时间格式固定宽度、可按字符串比较；同一工单取较新的一方。
+        // 新登记的工单仍随本次读取进入列表，已确认但本次缺失的工单也保留。
+        var merged = false;
+        for (var id in confirmed) {
+          var c = confirmed[id];
+          var idx = -1;
+          for (var i=0;i<arr.length;i++){ if (arr[i].id === id) { idx = i; break; } }
+          if (idx === -1) {
+            arr.push(c); // 读取开始于分派前而未包含该工单：仍应留在列表中
+            merged = true;
+          } else if (String(c.updatedAt) > String(arr[idx].updatedAt)) {
+            arr[idx] = c; // 列表内容较旧：保留已确认的处理结果
+          } else {
+            delete confirmed[id]; // 列表已追平或更新，确认记录不再需要
+          }
+        }
+        if (merged) {
+          // 补入缺失工单后恢复与服务端一致的排列：创建时间从新到旧。
+          arr.sort(function(a, b){
+            if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+            return a.id < b.id ? 1 : -1;
+          });
+        }
         loaded = arr; // 只有读取成功才替换，失败时保留原列表
         renderList();
       })
