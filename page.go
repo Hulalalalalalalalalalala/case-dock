@@ -148,6 +148,12 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   // 请求结束时版本已变，说明等待期间用户开始了另一份登记，
   // 该结果只属于清空重填之前的那次提交，不能改动当前表单。
   var draftVersion = 0;
+  // 等待结果期间是否修改过任一登记字段：每次提交时以提交内容为准清零，
+  // 之后任何输入或选择变化都置位。成功返回时若已置位，说明当前表单
+  // 是另一份尚未提交的新登记，不能清空，也不能填回旧请求中的值。
+  var editedSinceSubmit = false;
+  form.addEventListener("input", function(){ editedSinceSubmit = true; });
+  form.addEventListener("change", function(){ editedSinceSubmit = true; });
   function newSubmitId(){
     if (window.crypto && window.crypto.getRandomValues) {
       var b = new Uint8Array(16);
@@ -210,6 +216,9 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     // 结果只归属于提交时的这份登记：版本在提交时固定，等待期间
     // 用户“清空重填”会使版本变化，结果不得清空或改动新登记的内容。
     var submittedVersion = draftVersion;
+    // 以提交时的内容为基准：之后的字段修改都属于等待期间的新编辑，
+    // 成功返回时不得连同这些修改一起清空。
+    editedSinceSubmit = false;
     function draftReplaced(){
       return draftVersion !== submittedVersion;
     }
@@ -250,21 +259,44 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         if (r.status === 200) {
           msg = "该提交此前已登记成功，返回原工单，编号：" + r.data.id;
         }
+        submitId = newSubmitId(); // 已成功的标识不再沿用，下一份登记使用新标识
+        loadTickets();
+        if (editedSinceSubmit) {
+          // 等待期间用户修改过登记字段：当前表单是另一份尚未提交的新登记，
+          // 按返回时的当前内容原样保留（含换行、前导零与各项选择），
+          // 不清空也不填回旧值，更不自动再次提交，由用户决定何时提交。
+          setNotice("ok", msg + "。\n等待期间修改的内容尚未提交到该工单，" +
+            "已按原样保留为一份新登记，确认后可再次提交。");
+          editedSinceSubmit = false;
+          return;
+        }
         setNotice("ok", msg);
         form.reset();
-        submitId = newSubmitId(); // 开始另一份登记使用新标识
-        loadTickets();
       } else if (r.status === 409) {
-        setNotice("err", "提交标识冲突：" + (r.data.error || "同一提交标识对应了不同内容") +
-          "\n记录未改动。可改回原内容重试，或按“清空重填”开始另一份登记。");
+        var conflictMsg = "提交标识冲突：" + (r.data.error || "同一提交标识对应了不同内容") +
+          "\n记录未改动。可改回原内容重试，或按“清空重填”开始另一份登记。";
+        if (editedSinceSubmit) {
+          conflictMsg += "\n该冲突属于提交时的那份登记；当前表单（含等待期间的修改）尚未提交，内容已保留。";
+        }
+        setNotice("err", conflictMsg);
       } else {
-        setNotice("err", "登记失败（HTTP " + r.status + "）：" + (r.data.error || "未知错误") +
-          "\n填写内容已保留，请修改后重试。");
+        var failMsg = "登记失败（HTTP " + r.status + "）：" + (r.data.error || "未知错误");
+        if (editedSinceSubmit) {
+          failMsg += "\n该失败属于提交时的那份登记；当前表单（含等待期间的修改）尚未提交，内容已保留，可修改后重试。";
+        } else {
+          failMsg += "\n填写内容已保留，请修改后重试。";
+        }
+        setNotice("err", failMsg);
       }
     }).catch(function(){
       if (draftReplaced()) {
         setNotice("err", "清空重填之前的那次提交失败：无法连接服务。" +
           "\n该失败与当前这份登记无关，当前内容尚未提交，可继续填写后提交。");
+        return;
+      }
+      if (editedSinceSubmit) {
+        setNotice("err", "登记失败：无法连接服务。该失败属于提交时的那份登记；" +
+          "当前表单（含等待期间的修改）尚未提交，内容已保留，可修改后重试。");
         return;
       }
       setNotice("err", "登记失败：无法连接服务。填写内容已保留，请稍后重试。");
@@ -279,6 +311,7 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     clearNotice();
     submitId = newSubmitId(); // 放弃当前未成功的填写，按另一份登记处理
     draftVersion += 1; // 进行中的旧请求结果不再属于当前这份登记
+    editedSinceSubmit = false; // 清空后的空白表单不算等待期间的修改
   });
 
   // ---- 列表与详情 ----
