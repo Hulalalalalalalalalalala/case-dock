@@ -148,6 +148,16 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   // 请求结束时版本已变，说明等待期间用户开始了另一份登记，
   // 该结果只属于清空重填之前的那次提交，不能改动当前表单。
   var draftVersion = 0;
+  // 进行中的登记请求：同一时间至多一个（提交按钮在等待期间禁用）。
+  // 等待期间任一登记字段被改动时 edited 置为 true，使返回结果只处理
+  // 发出请求时的那份登记，不波及等待期间继续填写的内容。
+  var pendingSubmit = null;
+  form.addEventListener("input", function(){
+    if (pendingSubmit) pendingSubmit.edited = true;
+  });
+  form.addEventListener("change", function(){
+    if (pendingSubmit) pendingSubmit.edited = true;
+  });
   function newSubmitId(){
     if (window.crypto && window.crypto.getRandomValues) {
       var b = new Uint8Array(16);
@@ -208,10 +218,15 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     }
     submitBtn.disabled = true;
     // 结果只归属于提交时的这份登记：版本在提交时固定，等待期间
-    // 用户“清空重填”会使版本变化，结果不得清空或改动新登记的内容。
+    // 用户“清空重填”会使版本变化；用户继续修改任一登记字段会使
+    // edited 置位。两种情况下结果都不清空、不填回、不改动当前表单内容。
     var submittedVersion = draftVersion;
+    pendingSubmit = {edited: false};
     function draftReplaced(){
       return draftVersion !== submittedVersion;
+    }
+    function draftEdited(){
+      return !draftReplaced() && pendingSubmit && pendingSubmit.edited;
     }
     fetch("/api/tickets", {
       method: "POST",
@@ -250,10 +265,32 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         if (r.status === 200) {
           msg = "该提交此前已登记成功，返回原工单，编号：" + r.data.id;
         }
-        setNotice("ok", msg);
-        form.reset();
-        submitId = newSubmitId(); // 开始另一份登记使用新标识
         loadTickets();
+        if (draftEdited()) {
+          // 等待期间用户继续修改过：之前的提交照常登记并进入列表，
+          // 但当前表单是一份尚未提交的新登记，保留返回时的全部当前值，
+          // 不清空、不填回旧请求的内容，并换用新的提交标识，
+          // 下次提交按新登记处理，不自动再次提交。
+          submitId = newSubmitId();
+          setNotice("ok", msg +
+            "。\n您在等待结果期间修改的内容尚未提交，已按当前填写原样保留，请确认后再次提交。");
+        } else {
+          setNotice("ok", msg);
+          form.reset();
+          submitId = newSubmitId(); // 开始另一份登记使用新标识
+        }
+      } else if (draftEdited()) {
+        // 请求失败属于此前发出的那次提交；当前内容是返回时表单里的内容，
+        // 原样保留并恢复提交按钮，用户可继续修改后重试。
+        if (r.status === 409) {
+          setNotice("err", "此前的提交出现提交标识冲突：" +
+            (r.data.error || "同一提交标识对应了不同内容") +
+            "\n记录未改动，该结果不代表当前内容已保存。当前填写已保留；可改回原内容沿用原标识重试，或按“清空重填”开始另一份登记。");
+        } else {
+          setNotice("err", "此前的提交失败（HTTP " + r.status + "）：" +
+            (r.data.error || "未知错误") +
+            "\n当前填写已保留，可继续修改后重试。");
+        }
       } else if (r.status === 409) {
         setNotice("err", "提交标识冲突：" + (r.data.error || "同一提交标识对应了不同内容") +
           "\n记录未改动。可改回原内容重试，或按“清空重填”开始另一份登记。");
@@ -265,10 +302,13 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       if (draftReplaced()) {
         setNotice("err", "清空重填之前的那次提交失败：无法连接服务。" +
           "\n该失败与当前这份登记无关，当前内容尚未提交，可继续填写后提交。");
-        return;
+      } else if (draftEdited()) {
+        setNotice("err", "此前的提交失败：无法连接服务。当前填写已保留，可继续修改后重试。");
+      } else {
+        setNotice("err", "登记失败：无法连接服务。填写内容已保留，请稍后重试。");
       }
-      setNotice("err", "登记失败：无法连接服务。填写内容已保留，请稍后重试。");
     }).finally(function(){
+      pendingSubmit = null;
       // 无论结果归属哪份登记，旧请求结束后提交按钮都恢复正常。
       submitBtn.disabled = false;
     });
