@@ -325,6 +325,20 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   var listArea = document.getElementById("list-area");
   var detail = document.getElementById("detail");
   var loaded = [];
+  // confirmed 记录分派接口已确认成功的工单内容（工单编号 -> 工单）。
+  // 列表读取可能拿到分派确认之前的旧内容，且响应晚于分派结果返回；
+  // 合并时以已确认的结果为准，不让旧列表撤回已确认的处理结果。
+  var confirmed = {};
+
+  // newerTicket 判断 a 是否不旧于 b：最近处理时间更晚，或时间相同但分派记录更全。
+  // 时间字符串是固定宽度格式，可直接按文字比较先后。
+  function newerTicket(a, b){
+    var ta = a.updatedAt || "", tb = b.updatedAt || "";
+    if (ta !== tb) return ta > tb;
+    var la = Array.isArray(a.assignments) ? a.assignments.length : 0;
+    var lb = Array.isArray(b.assignments) ? b.assignments.length : 0;
+    return la >= lb;
+  }
 
   function escapeHtml(s){
     return String(s).replace(/[&<>"']/g, function(c){
@@ -500,6 +514,7 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     }).then(function(r){
       if (r.status === 200 && r.data && r.data.ticket) {
         var nt = r.data.ticket;
+        confirmed[nt.id] = nt; // 已确认成功的处理结果，旧列表响应不能将其撤回
         for (var i=0;i<loaded.length;i++){ // 列表立即显示新负责人与本次处理时间
           if (loaded[i].id === nt.id) { loaded[i] = nt; break; }
         }
@@ -583,7 +598,16 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       })
       .then(function(data){
         var arr = Array.isArray(data.tickets) ? data.tickets : [];
-        loaded = arr; // 只有读取成功才替换，失败时保留原列表
+        // 只有读取成功才合并，失败时保留原列表。合并保留接口返回的排列
+        // （按创建时间从新到旧），新登记的工单照常进入列表；但对每张工单，
+        // 若本地已有分派接口确认成功的更新结果，而本次读到的是确认之前的
+        // 旧内容，则继续显示已确认的负责人、最近处理时间与分派记录。
+        loaded = arr.map(function(t){
+          var c = confirmed[t.id];
+          if (c && newerTicket(c, t)) return c; // 已确认的结果更新，不被旧列表撤回
+          if (c) confirmed[t.id] = t; // 列表内容不旧于已确认结果，采纳并同步
+          return t;
+        });
         renderList();
       })
       .catch(function(err){
