@@ -297,19 +297,23 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   function row(k){
     return '<dt>' + escapeHtml(k) + '</dt><dd></dd>';
   }
-  var current = null;    // 详情中正在查看的工单
-  var assignOpId = null; // 本次分派操作的标识：未成功时保持不变可重试，成功后重新生成
+  // 每次打开详情都会创建独立的视图对象，输入内容、提示、按钮状态与操作标识都从属于它。
+  // 分派提交时锁定自己的视图；结果返回后只有该视图仍是当前视图时才回写详情，
+  // 保证迟到的结果始终归属于提交时的工单，不影响用户正在查看或准备分派的另一张工单。
+  var view = null;
 
-  function setAssignNotice(kind, text){
-    var n = document.getElementById("assign-notice");
+  function setViewNotice(v, kind, text){
+    var n = v.notice;
     if (!n) return;
     n.className = "notice " + kind;
     n.textContent = text; // 以文本节点显示，不执行其中的页面代码
   }
 
   function showDetail(t){
-    current = t;
-    assignOpId = newSubmitId(); // 每次打开详情开始一次新的分派操作
+    view = {
+      ticket: t,
+      opId: newSubmitId() // 每次打开详情开始一次新的分派操作
+    };
     detail.innerHTML =
       '<button type="button" class="secondary close">关闭</button>' +
       "<h3>工单详情</h3><dl>" +
@@ -328,6 +332,10 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       '<div id="assign-notice" class="notice" role="alert"></div>' +
       "</form>";
     fillDetail(t);
+    // 缓存属于本视图的表单元素，回调只操作这些元素，不按 id 查找当前详情
+    view.input = document.getElementById("f-assignee");
+    view.btn = document.getElementById("assign-btn");
+    view.notice = document.getElementById("assign-notice");
     detail.classList.add("open");
     detail.setAttribute("aria-hidden","false");
     detail.scrollIntoView({behavior:"smooth", block:"nearest"});
@@ -365,25 +373,28 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   detail.addEventListener("submit", function(ev){
     if (!ev.target || ev.target.id !== "assign-form") return;
     ev.preventDefault();
-    if (!current) return;
-    var input = document.getElementById("f-assignee");
-    var btn = document.getElementById("assign-btn");
+    var v = view;
+    if (!v) return;
+    var input = v.input;
+    var btn = v.btn;
     var assignee = input.value.trim();
     if (!assignee) {
-      setAssignNotice("err", "请填写负责人。");
+      setViewNotice(v, "err", "请填写负责人。");
       return;
     }
     if (assignee === "未分派") {
-      setAssignNotice("err", "负责人不能填写“未分派”。");
+      setViewNotice(v, "err", "负责人不能填写“未分派”。");
       return;
     }
-    setAssignNotice("", "");
+    setViewNotice(v, "", "");
+    // 只锁定本视图自己的按钮；切换到的另一张工单有它自己的视图与按钮状态
     btn.disabled = true;
     btn.textContent = "正在分派…";
-    fetch("/api/tickets/" + encodeURIComponent(current.id) + "/assignment", {
+    var targetId = v.ticket.id;
+    fetch("/api/tickets/" + encodeURIComponent(targetId) + "/assignment", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({assignee: assignee, operationId: assignOpId})
+      body: JSON.stringify({assignee: assignee, operationId: v.opId})
     }).then(function(resp){
       return resp.json().catch(function(){ return {}; }).then(function(data){
         return {status: resp.status, data: data};
@@ -395,35 +406,51 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
           if (loaded[i].id === nt.id) { loaded[i] = nt; break; }
         }
         renderList();
-        current = nt;
-        fillDetail(nt);
-        assignOpId = newSubmitId(); // 本次操作已成功，下一次分派使用新标识
-        input.value = "";
-        setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
-      } else if (r.status === 400) {
-        setAssignNotice("err", "输入错误：" + (r.data.error || "请检查填写内容") +
-          "\n填写内容已保留，可修改后重试。");
-      } else if (r.status === 404) {
-        setAssignNotice("err", "工单不存在：" + (r.data.error || current.id) +
-          "\n请刷新列表后重试。");
-      } else if (r.status === 409) {
-        setAssignNotice("err", "操作标识冲突：" + (r.data.error || "同一操作标识对应了不同负责人") +
-          "\n记录未改动。请关闭详情后重新打开再分派。");
+        if (view === v) { // 用户仍停留在提交时的详情：成功结果只写回这一个视图
+          v.ticket = nt;
+          fillDetail(nt);
+          v.opId = newSubmitId(); // 本次操作已成功，下一次分派使用新标识
+          input.value = "";
+          setViewNotice(v, "ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+        }
       } else {
-        setAssignNotice("err", "分派失败（HTTP " + r.status + "）：" + (r.data.error || "未知错误") +
-          "\n填写内容已保留，请重试。");
+        // 失败结果只属于提交时的视图，不能覆盖另一张工单自身的提示或等待状态
+        var msg;
+        if (r.status === 400) {
+          msg = "输入错误：" + (r.data.error || "请检查填写内容") +
+            "\n填写内容已保留，可修改后重试。";
+        } else if (r.status === 404) {
+          msg = "工单不存在：" + (r.data.error || targetId) +
+            "\n请刷新列表后重试。";
+        } else if (r.status === 409) {
+          msg = "操作标识冲突：" + (r.data.error || "同一操作标识对应了不同负责人") +
+            "\n记录未改动。请关闭详情后重新打开再分派。";
+        } else {
+          msg = "分派失败（HTTP " + r.status + "）：" + (r.data.error || "未知错误") +
+            "\n填写内容已保留，请重试。";
+        }
+        if (view === v) {
+          setViewNotice(v, "err", msg); // 填写内容原样保留，操作标识不变，可直接重试
+        }
       }
     }).catch(function(){
-      setAssignNotice("err", "分派失败：无法连接服务。填写内容已保留，请稍后重试。");
+      var netMsg = "分派失败：无法连接服务。填写内容已保留，请稍后重试。";
+      if (view === v) {
+        setViewNotice(v, "err", netMsg);
+      }
     }).finally(function(){
+      // 只恢复提交时视图自己的按钮；另一张工单的等待状态不由本次结果解除
       btn.disabled = false;
       btn.textContent = "提交分派";
     });
   });
   detail.addEventListener("click", function(ev){
     if (ev.target.classList.contains("close")) {
+      // 关闭详情不取消已提交的分派；其结果只更新列表数据，不重新打开详情
+      view = null;
       detail.classList.remove("open");
       detail.setAttribute("aria-hidden","true");
+      detail.innerHTML = "";
     }
   });
 
