@@ -464,10 +464,20 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
       setAssignNotice("err", "负责人不能填写“未分派”。");
       return;
     }
-    // 结果只归属于提交时的工单：编号与操作标识在提交时固定，
-    // 之后关闭详情或查看其他工单都不改变本次请求的去向与结果的归属。
+    // 结果只归属于提交时的工单：编号、操作标识与负责人在提交时固定，
+    // 之后关闭详情、查看其他工单或继续修改输入都不改变本次请求的去向与归属。
     var ticketId = current.id;
     var opId = assignOpId;
+    var submittedAssignee = assignee; // 本次实际发出的负责人（去除首尾空白后）
+    // 等待结果期间对“提交时那个输入框”的修改只表示用户在准备下一次分派：
+    // 置位 edited，但不改变已发出的请求，也不自动再次提交。
+    // 监听直接绑在提交时的输入框上；详情重开后会渲染出新的输入框，
+    // 在新输入框里的填写不会记到旧请求头上。
+    var inputEl = input;
+    var edited = false;
+    function onAssignInput(){ edited = true; }
+    inputEl.addEventListener("input", onAssignInput);
+    inputEl.addEventListener("change", onAssignInput);
     setAssignNotice("", "");
     btn.disabled = true;
     btn.textContent = "正在分派…";
@@ -495,28 +505,62 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         if (!viewingThis()) return; // 已关闭或切换查看对象：详情保持原样
         current = nt;
         fillDetail(nt);
-        assignOpId = newSubmitId(); // 本次操作已成功，下一次分派使用新标识
-        document.getElementById("f-assignee").value = "";
-        setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+        assignOpId = newSubmitId(); // 本次操作已成功（含负责人未变化），下一次分派使用新标识
+        var liveInput = document.getElementById("f-assignee");
+        if (liveInput === inputEl && edited) {
+          // 等待期间编辑过输入：已完成的分派以提交时的负责人为准，负责人、
+          // 最近处理时间与分派记录照常展示；输入框保留返回时的当前内容，
+          // 原样不动（包括首尾空白或被用户主动清空），不能拿请求内容填回。
+          // 提示说清这次实际分派给了谁，以及当前内容尚未提交、不会自动再次提交。
+          var doneMsg = r.data.changed
+            ? "分派成功，负责人：" + nt.assignee
+            : "负责人未变化，仍为：" + nt.assignee;
+          setAssignNotice("ok", doneMsg +
+            "。\n您在等待结果期间填写的内容尚未提交，已按当前填写原样保留，请确认后再次提交。");
+        } else {
+          // 没有编辑过输入时，成功后仍清空输入；详情已重开成新表单时
+          // 不动新表单的输入框（其内容与本请求无关）。
+          if (liveInput === inputEl) liveInput.value = "";
+          setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+        }
       } else if (!viewingThis()) {
         return; // 失败提示只属于提交时的工单，不覆盖另一张工单的提示
       } else if (r.status === 400) {
         setAssignNotice("err", "输入错误：" + (r.data.error || "请检查填写内容") +
           "\n填写内容已保留，可修改后重试。");
       } else if (r.status === 404) {
-        setAssignNotice("err", "工单不存在：" + (r.data.error || ticketId) +
-          "\n请刷新列表后重试。");
+        if (edited) {
+          setAssignNotice("err", "此前分派给“" + submittedAssignee + "”的请求返回：工单不存在：" +
+            (r.data.error || ticketId) +
+            "\n请刷新列表后重试。输入框中当前内容尚未提交，已原样保留。");
+        } else {
+          setAssignNotice("err", "工单不存在：" + (r.data.error || ticketId) +
+            "\n请刷新列表后重试。");
+        }
       } else if (r.status === 409) {
         setAssignNotice("err", "操作标识冲突：" + (r.data.error || "同一操作标识对应了不同负责人") +
           "\n记录未改动。请关闭详情后重新打开再分派。");
+      } else if (edited) {
+        // 失败属于此前发出的那次分派：提示要对应当时提交的负责人，
+        // 不能把后来输入的内容描述成已分派；当前输入原样保留。
+        setAssignNotice("err", "此前分派给“" + submittedAssignee + "”的请求失败（HTTP " + r.status + "）：" +
+          (r.data.error || "未知错误") +
+          "\n输入框中当前填写的内容尚未提交，已原样保留，可继续修改后重试。");
       } else {
         setAssignNotice("err", "分派失败（HTTP " + r.status + "）：" + (r.data.error || "未知错误") +
           "\n填写内容已保留，请重试。");
       }
     }).catch(function(){
       if (!viewingThis()) return;
-      setAssignNotice("err", "分派失败：无法连接服务。填写内容已保留，请稍后重试。");
+      if (edited) {
+        setAssignNotice("err", "此前分派给“" + submittedAssignee + "”的请求失败：无法连接服务。" +
+          "\n输入框中当前填写的内容尚未提交，已原样保留，可稍后重试。");
+      } else {
+        setAssignNotice("err", "分派失败：无法连接服务。填写内容已保留，请稍后重试。");
+      }
     }).finally(function(){
+      inputEl.removeEventListener("input", onAssignInput);
+      inputEl.removeEventListener("change", onAssignInput);
       assignPending[ticketId] -= 1;
       if (assignPending[ticketId] <= 0) delete assignPending[ticketId];
       if (!viewingThis() || assignPending[ticketId]) return; // 不解除其他工单自己等待结果的状态
