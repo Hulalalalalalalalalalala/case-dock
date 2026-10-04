@@ -59,6 +59,33 @@ export async function openDetail(h, ticketId) {
   await h.page.waitForSelector("#detail.open #assign-form", { visible: true });
 }
 
+// closeDetail 点击详情中的“关闭”按钮。
+export async function closeDetail(h) {
+  await h.page.click("#detail .close");
+}
+
+// registerViaForm 通过页面登记表单提交一张新工单，触发成功后对列表的重新读取；
+// 等待新工单出现在列表中（说明本次读取与合并已完成），返回新工单编号。
+export async function registerViaForm(h, description) {
+  await h.page.evaluate((desc) => {
+    document.getElementById("f-description").value = desc;
+    document.getElementById("f-contactName").value = "张三";
+    document.getElementById("f-contactInfo").value = "010-88886666";
+    document.getElementById("f-source").value = "电话";
+    document.getElementById("f-category").value = "账号";
+    document.getElementById("f-priority").value = "普通";
+  }, description);
+  await h.page.click("#submit-btn");
+  await h.page.waitForFunction(() =>
+    document.getElementById("form-notice").classList.contains("ok"),
+  );
+  const noticeText = await h.page.$eval("#form-notice", (n) => n.textContent);
+  const m = /编号：(TKT-\d+)/.exec(noticeText);
+  assert.ok(m, `登记成功提示应包含新工单编号，实际：${noticeText}`);
+  await waitForRow(h, m[1], "未分派"); // 列表重新读取与合并已完成
+  return m[1];
+}
+
 // setAssignee 以派发 input 事件的方式写入负责人输入框（含首尾空白时按原样写入）。
 export async function setAssignee(h, value) {
   await h.page.focus("#f-assignee");

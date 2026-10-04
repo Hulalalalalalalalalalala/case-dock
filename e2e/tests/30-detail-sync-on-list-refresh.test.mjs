@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { launchBrowser, createHarness } from "../lib/harness.mjs";
 import {
   registerTicket, openApp, openDetail, setAssignee, submitAndWaitHeld,
-  waitSettled, readState, rowOf, fmtMinute, waitForRow,
+  waitSettled, readState, rowOf, fmtMinute, registerViaForm,
 } from "../lib/ui.mjs";
 
 const browser = await launchBrowser();
@@ -17,7 +17,7 @@ async function setup() {
   return { h, ticket };
 }
 
-// assignDirect 直连真实服务分派工单（不经过门控），模拟另一页面的转交。
+// assignDirect 直连真实服务分派/转交工单（不经过门控），模拟另一页面的操作。
 async function assignDirect(h, ticketId, assignee, opId) {
   const resp = await fetch(`${h.upstream}/api/tickets/${ticketId}/assignment`, {
     method: "POST",
@@ -26,28 +26,6 @@ async function assignDirect(h, ticketId, assignee, opId) {
   });
   assert.equal(resp.status, 200, "直接分派应成功");
   return resp.json();
-}
-
-// registerViaForm 通过页面登记表单提交一张新工单，触发成功后对列表的重新读取；
-// 等待新工单出现在列表中（说明本次读取与合并已完成），返回新工单编号。
-async function registerViaForm(h, description) {
-  await h.page.evaluate((desc) => {
-    document.getElementById("f-description").value = desc;
-    document.getElementById("f-contactName").value = "张三";
-    document.getElementById("f-contactInfo").value = "010-88886666";
-    document.getElementById("f-source").value = "电话";
-    document.getElementById("f-category").value = "账号";
-    document.getElementById("f-priority").value = "普通";
-  }, description);
-  await h.page.click("#submit-btn");
-  await h.page.waitForFunction(() =>
-    document.getElementById("form-notice").classList.contains("ok"),
-  );
-  const noticeText = await h.page.$eval("#form-notice", (n) => n.textContent);
-  const m = /编号：(TKT-\d+)/.exec(noticeText);
-  assert.ok(m, `登记成功提示应包含新工单编号，实际：${noticeText}`);
-  await waitForRow(h, m[1], "未分派"); // 列表重新读取与合并已完成
-  return m[1];
 }
 
 test("同步-1：列表刷新后，已打开详情同步显示另一页面转交后的负责人、最近处理时间与分派记录", async () => {

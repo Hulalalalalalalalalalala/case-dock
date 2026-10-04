@@ -325,9 +325,10 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   var listArea = document.getElementById("list-area");
   var detail = document.getElementById("detail");
   var loaded = [];
-  // confirmed 记录分派接口已确认成功的工单内容（工单编号 -> 工单）。
-  // 列表读取可能拿到分派确认之前的旧内容，且响应晚于分派结果返回；
-  // 合并时以已确认的结果为准，不让旧列表撤回已确认的处理结果。
+  // confirmed 记录页面已知最新的工单内容（工单编号 -> 工单）：
+  // 来自分派接口确认成功的结果，或列表读取到的更晚转交。
+  // 旧列表、旧分派响应可能晚于更新的结果返回，合并时以这里的最新内容为准，
+  // 不让任何旧响应撤回更新的负责人、最近处理时间与分派记录。
   var confirmed = {};
 
   // newerTicket 判断 a 是否不旧于 b：最近处理时间更晚，或时间相同但分派记录更全。
@@ -338,6 +339,17 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     var la = Array.isArray(a.assignments) ? a.assignments.length : 0;
     var lb = Array.isArray(b.assignments) ? b.assignments.length : 0;
     return la >= lb;
+  }
+
+  // strictlyNewer 判断 a 是否确实比 b 更新（时间更晚，或同时间下记录更多）。
+  // 时间与记录数都相同说明两份内容一致，不算更新——否则负责人未变化的
+  // 成功响应会被误判成“工单随后又被转交”。
+  function strictlyNewer(a, b){
+    var ta = a.updatedAt || "", tb = b.updatedAt || "";
+    if (ta !== tb) return ta > tb;
+    var la = Array.isArray(a.assignments) ? a.assignments.length : 0;
+    var lb = Array.isArray(b.assignments) ? b.assignments.length : 0;
+    return la > lb;
   }
 
   function escapeHtml(s){
@@ -514,23 +526,59 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     }).then(function(r){
       if (r.status === 200 && r.data && r.data.ticket) {
         var nt = r.data.ticket;
-        confirmed[nt.id] = nt; // 已确认成功的处理结果，旧列表响应不能将其撤回
-        for (var i=0;i<loaded.length;i++){ // 列表立即显示新负责人与本次处理时间
-          if (loaded[i].id === nt.id) { loaded[i] = nt; break; }
+        // 本次操作实际确认的负责人与是否改变了负责人，以后端响应为准。
+        var opAssignee = nt.assignee;
+        var opChanged = r.data.changed;
+        // 页面上已知的该工单最新内容：可能来自此前已确认的分派结果，也可能
+        // 来自等待结果期间的列表重新读取（例如另一页面已把工单转交给别人）。
+        var prev = confirmed[nt.id];
+        for (var li=0; li<loaded.length; li++){
+          var cand = loaded[li];
+          if (cand.id === nt.id && (!prev || strictlyNewer(cand, prev))) prev = cand;
+        }
+        var overtaken = !!prev && strictlyNewer(prev, nt);
+        // 若等待期间列表已显示了更晚的处理结果（另一页面随后的转交），
+        // 本次旧响应不能把负责人、最近处理时间与分派记录退回先前的内容：
+        // 列表与详情继续显示更新的那一份；否则采纳本次确认的结果。
+        var cur = overtaken ? prev : nt;
+        confirmed[nt.id] = cur; // 已确认/最新的处理结果，旧响应不能将其撤回
+        for (var i=0;i<loaded.length;i++){ // 列表与详情显示同一份最新内容
+          if (loaded[i].id === nt.id) { loaded[i] = cur; break; }
         }
         renderList();
         if (!viewingThis()) return; // 已关闭或切换查看对象：详情保持原样
-        current = nt;
-        fillDetail(nt);
+        current = cur;
+        fillDetail(cur);
         assignOpId = newSubmitId(); // 本次操作已成功，下一次分派使用新标识
         var fAssignee = document.getElementById("f-assignee");
-        if (assignEdited[ticketId]) {
+        var keptMsg;
+        if (overtaken) {
+          // 本次分派确实成功，但工单随后又被转交：说明本次曾分派给谁，
+          // 同时说明当前负责人已是别人——不能把当前负责人描述成本次目标，
+          // 也不能提示当前负责人仍是本次分派的人。
+          keptMsg = opChanged
+            ? "分派成功，本次曾分派给：" + opAssignee + "。" +
+              "该工单随后已转交给他人，当前负责人为：" + cur.assignee + "。"
+            : "提交的负责人与当时的负责人相同，本次负责人未变化，当时负责人为：" + opAssignee + "。" +
+              "该工单随后已转交给他人，当前负责人为：" + cur.assignee + "。";
+          if (assignEdited[ticketId]) {
+            if (fAssignee.value.trim() === "") {
+              keptMsg += "\n您在等待结果期间清空了输入框，当前内容为空且尚未提交；按钮已恢复，可重新填写后再分派。";
+            } else {
+              keptMsg += "\n输入框中的当前内容尚未提交，已原样保留（包括首尾空白）；按钮已恢复，请确认后再次提交分派。";
+            }
+          } else {
+            // 等待期间完全没有编辑：与普通成功一致，照常清空输入。
+            fAssignee.value = "";
+          }
+          setAssignNotice("ok", keptMsg);
+        } else if (assignEdited[ticketId]) {
           // 等待期间改动过输入（含主动清空、仅改动首尾空白）：不写回本次
           // 请求的负责人，保留返回时输入框里的当前内容，它属于尚未提交的
           // 下一次分派；提示先讲清这次实际分派给了谁。
-          var keptMsg = r.data.changed
-            ? "分派成功，本次实际分派给：" + nt.assignee + "。"
-            : "提交的负责人与当前负责人相同，负责人未变化，仍为：" + nt.assignee + "。";
+          keptMsg = opChanged
+            ? "分派成功，本次实际分派给：" + opAssignee + "。"
+            : "提交的负责人与当前负责人相同，负责人未变化，仍为：" + opAssignee + "。";
           if (fAssignee.value.trim() === "") {
             keptMsg += "\n您在等待结果期间清空了输入框，当前内容为空且尚未提交；按钮已恢复，可重新填写后再分派。";
           } else {
@@ -540,7 +588,7 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         } else {
           // 等待期间没有编辑过：成功后照常清空输入并恢复提交按钮。
           fAssignee.value = "";
-          setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+          setAssignNotice("ok", opChanged ? "分派成功，负责人：" + opAssignee : "负责人未变化");
         }
       } else if (!viewingThis()) {
         return; // 失败提示只属于提交时的工单，不覆盖另一张工单的提示

@@ -85,6 +85,10 @@ async function startProxy(upstream) {
   const held = []; // 挂起的分派请求：{req, res, body}
   const waiters = [];
   const arrivals = []; // 所有到达过的分派请求（放行后也保留），按到达顺序
+  // parked 是已转发到真实服务、服务也已保存并响应，但响应尚未发回浏览器的
+  // 分派请求：{res, status, headers, buf, body}。用于确定性复现
+  // “服务已保存成功、响应还在途中时另一页面又转交了工单”的场景。
+  const parked = [];
   let assignCount = 0;
 
   function pump() {
@@ -181,6 +185,45 @@ async function startProxy(upstream) {
     },
     heldCount() {
       return held.length;
+    },
+    parkedCount() {
+      return parked.length;
+    },
+    // parkNext 把最早挂起的分派请求转发到真实服务并等待服务响应（此时服务端
+    // 已保存本次分派），但先把响应扣下不发回浏览器，返回解析后的响应体。
+    // 随后可用 deliverParked 把这个“迟到的成功响应”放行给页面。
+    async parkNext() {
+      const item = held.shift();
+      const url = new URL(item.req.url, upstream);
+      const headers = {};
+      for (const [k, v] of Object.entries(item.req.headers)) {
+        if (!HOP_HEADERS.has(k.toLowerCase())) headers[k] = v;
+      }
+      const upstreamResp = await fetch(url, {
+        method: item.req.method,
+        headers,
+        body: item.body || undefined,
+      });
+      const respHeaders = {};
+      upstreamResp.headers.forEach((v, k) => {
+        if (!HOP_HEADERS.has(k.toLowerCase())) respHeaders[k] = v;
+      });
+      const buf = Buffer.from(await upstreamResp.arrayBuffer());
+      const parkedItem = {
+        res: item.res,
+        status: upstreamResp.status,
+        headers: respHeaders,
+        buf,
+        body: JSON.parse(buf.toString("utf8") || "null"),
+      };
+      parked.push(parkedItem);
+      return parkedItem.body;
+    },
+    // deliverParked 放行最早被扣下的分派响应到浏览器。
+    deliverParked() {
+      const item = parked.shift();
+      item.res.writeHead(item.status, item.headers);
+      item.res.end(item.buf);
     },
     // arrivals 返回所有到达过的分派请求（含已放行的），按到达顺序解析。
     arrivals() {
