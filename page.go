@@ -325,9 +325,10 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
   var listArea = document.getElementById("list-area");
   var detail = document.getElementById("detail");
   var loaded = [];
-  // confirmed 记录分派接口已确认成功的工单内容（工单编号 -> 工单）。
-  // 列表读取可能拿到分派确认之前的旧内容，且响应晚于分派结果返回；
-  // 合并时以已确认的结果为准，不让旧列表撤回已确认的处理结果。
+  // confirmed 记录列表已读取到的各工单最新内容（工单编号 -> 工单），
+  // 是“服务端当前工单”在本页面的最新快照：列表重新读取成功后逐张同步。
+  // 分派确认可能早于或晚于列表读取返回，合并双方时都不能让较旧的一方
+  // 撤回较新的一方（如等待期间另一页面又转交了工单）。
   var confirmed = {};
 
   // newerTicket 判断 a 是否不旧于 b：最近处理时间更晚，或时间相同但分派记录更全。
@@ -338,6 +339,37 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     var la = Array.isArray(a.assignments) ? a.assignments.length : 0;
     var lb = Array.isArray(b.assignments) ? b.assignments.length : 0;
     return la >= lb;
+  }
+
+  // mergeAssignments 按发生顺序合并两次读取到的分派记录。同一时刻只会有
+  // 一次实际变化（服务端串行处理），同一事件在两份快照中三个字段完全相同，
+  // 据此去重即可保留双方记录；不同时刻的记录按时间（固定宽度字符串）升序。
+  function mergeAssignments(a, b){
+    var out = [];
+    function add(rec){
+      for (var i=0;i<out.length;i++){
+        var o = out[i];
+        if (o.at === rec.at && o.from === rec.from && o.to === rec.to) return;
+      }
+      out.push(rec);
+    }
+    (Array.isArray(a) ? a : []).forEach(add);
+    (Array.isArray(b) ? b : []).forEach(add);
+    return out.sort(function(r1, r2){
+      var a1 = r1.at || "", a2 = r2.at || "";
+      return a1 < a2 ? -1 : a1 > a2 ? 1 : 0;
+    });
+  }
+
+  // mergeTicket 合并两份同一工单的内容，始终保留较新一份的负责人与最近处理
+  // 时间，并把两份中的分派记录按发生顺序合并（同一事件去重）。incoming 较新
+  // （或本地尚无旧内容）时直接采纳；否则保留 known 的负责人与处理时间，仅补齐
+  // incoming 中而 known 缺失的分派记录。用于迟到的分派成功响应与列表读取
+  // 双向合并：任何一方较旧都不能撤回另一方已展示的处理结果。
+  function mergeTicket(incoming, known){
+    if (!known || newerTicket(incoming, known)) return incoming;
+    var mergedRecs = mergeAssignments(incoming.assignments, known.assignments);
+    return Object.assign({}, known, {assignments: mergedRecs});
   }
 
   function escapeHtml(s){
@@ -514,23 +546,46 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     }).then(function(r){
       if (r.status === 200 && r.data && r.data.ticket) {
         var nt = r.data.ticket;
-        confirmed[nt.id] = nt; // 已确认成功的处理结果，旧列表响应不能将其撤回
-        for (var i=0;i<loaded.length;i++){ // 列表立即显示新负责人与本次处理时间
-          if (loaded[i].id === nt.id) { loaded[i] = nt; break; }
+        // 请求在途期间工单可能已被另一页面转交，而列表重新读取已经显示了
+        // 转交后的内容：迟到的成功响应不能把负责人、最近处理时间与分派记录
+        // 退回响应中的旧内容。与页面已知的最新内容合并后再更新列表与详情。
+        var merged = mergeTicket(nt, confirmed[nt.id]);
+        confirmed[nt.id] = merged; // 页面已知的最新工单内容，供后续列表读取比较新旧
+        for (var i=0;i<loaded.length;i++){ // 列表立即显示合并后的负责人与处理时间
+          if (loaded[i].id === nt.id) { loaded[i] = merged; break; }
         }
         renderList();
         if (!viewingThis()) return; // 已关闭或切换查看对象：详情保持原样
-        current = nt;
-        fillDetail(nt);
+        current = merged;
+        fillDetail(merged);
         assignOpId = newSubmitId(); // 本次操作已成功，下一次分派使用新标识
         var fAssignee = document.getElementById("f-assignee");
-        if (assignEdited[ticketId]) {
-          // 等待期间改动过输入（含主动清空、仅改动首尾空白）：不写回本次
-          // 请求的负责人，保留返回时输入框里的当前内容，它属于尚未提交的
-          // 下一次分派；提示先讲清这次实际分派给了谁。
-          var keptMsg = r.data.changed
+        // superseded：工单随后又被转交，当前负责人已不是本次响应中的负责人。
+        // 提示必须区分“本次曾分派给谁”与“工单现在的负责人”，不能把当前
+        // 负责人描述成本次提交的目标，也不能说当前负责人仍是本次目标。
+        var superseded = merged.assignee !== nt.assignee;
+        var doneMsg;
+        if (!superseded) {
+          // 没有后续转交：沿用现有成功提示。
+          doneMsg = r.data.changed
             ? "分派成功，本次实际分派给：" + nt.assignee + "。"
             : "提交的负责人与当前负责人相同，负责人未变化，仍为：" + nt.assignee + "。";
+        } else if (r.data.changed) {
+          // 迟到的成功响应：本次分派确实生效，但工单在结果返回前又被转交。
+          doneMsg = "分派成功，本次曾分派给：" + nt.assignee + "。" +
+            "\n工单在结果返回前已被转交，当前负责人为：" + merged.assignee +
+            "，列表与详情已显示转交后的最新状态与完整分派记录。";
+        } else {
+          // 迟到的是“负责人未变化”响应：提交时负责人确实未变，但随后已转交。
+          doneMsg = "提交的负责人与当时的负责人相同，提交时负责人未变化，当时为：" + nt.assignee + "。" +
+            "\n工单在结果返回前已被转交，当前负责人为：" + merged.assignee +
+            "，列表与详情已显示转交后的最新状态与完整分派记录。";
+        }
+        if (assignEdited[ticketId]) {
+          // 等待期间改动过输入（含主动清空、仅改动首尾空白）：不写回任何
+          // 负责人，保留返回时输入框里的当前内容，它属于尚未提交的
+          // 下一次分派；提示先讲清这次操作的结果与工单当前状态。
+          var keptMsg = doneMsg;
           if (fAssignee.value.trim() === "") {
             keptMsg += "\n您在等待结果期间清空了输入框，当前内容为空且尚未提交；按钮已恢复，可重新填写后再分派。";
           } else {
@@ -540,7 +595,11 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         } else {
           // 等待期间没有编辑过：成功后照常清空输入并恢复提交按钮。
           fAssignee.value = "";
-          setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+          if (superseded) {
+            setAssignNotice("ok", doneMsg);
+          } else {
+            setAssignNotice("ok", r.data.changed ? "分派成功，负责人：" + nt.assignee : "负责人未变化");
+          }
         }
       } else if (!viewingThis()) {
         return; // 失败提示只属于提交时的工单，不覆盖另一张工单的提示
@@ -600,12 +659,23 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
         var arr = Array.isArray(data.tickets) ? data.tickets : [];
         // 只有读取成功才合并，失败时保留原列表。合并保留接口返回的排列
         // （按创建时间从新到旧），新登记的工单照常进入列表；但对每张工单，
-        // 若本地已有分派接口确认成功的更新结果，而本次读到的是确认之前的
-        // 旧内容，则继续显示已确认的负责人、最近处理时间与分派记录。
+        // 列表读取与本地已知的最新内容可能互有新旧（分派确认与列表读取
+        // 返回先后不固定），始终采纳较新的一方，较旧的一方不能撤回较新的
+        // 负责人、最近处理时间与分派记录；双方各有的分派记录按发生顺序合并。
         loaded = arr.map(function(t){
           var c = confirmed[t.id];
-          if (c && newerTicket(c, t)) return c; // 已确认的结果更新，不被旧列表撤回
-          if (c) confirmed[t.id] = t; // 列表内容不旧于已确认结果，采纳并同步
+          if (!c) {
+            confirmed[t.id] = t; // 首次读到：作为该工单的最新快照
+            return t;
+          }
+          if (newerTicket(c, t)) {
+            // 本地内容更新（如刚到达的分派结果），不被旧列表撤回，
+            // 同时补齐列表这次读到的、本地可能缺失的分派记录。
+            var mc = mergeTicket(t, c);
+            confirmed[t.id] = mc;
+            return mc;
+          }
+          confirmed[t.id] = t; // 列表内容不旧于本地：采纳列表最新内容并同步
           return t;
         });
         renderList();

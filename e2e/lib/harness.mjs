@@ -5,6 +5,7 @@
 //   从而确定性地复现“提交后等待结果期间继续填写”的场景。
 import { spawn } from "node:child_process";
 import { execFileSync } from "node:child_process";
+import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
 import http from "node:http";
@@ -85,6 +86,9 @@ async function startProxy(upstream) {
   const held = []; // 挂起的分派请求：{req, res, body}
   const waiters = [];
   const arrivals = []; // 所有到达过的分派请求（放行后也保留），按到达顺序
+  // 已在真实服务处理完成、但响应暂不写回浏览器的分派请求：
+  // {res, status, headers, body}，由 deliverNextResponse 稍后放行。
+  const heldResponses = [];
   let assignCount = 0;
 
   function pump() {
@@ -94,7 +98,7 @@ async function startProxy(upstream) {
     }
   }
 
-  async function forward(item) {
+  async function forward(item, withhold = false) {
     const url = new URL(item.req.url, upstream);
     const headers = {};
     for (const [k, v] of Object.entries(item.req.headers)) {
@@ -109,9 +113,20 @@ async function startProxy(upstream) {
     upstreamResp.headers.forEach((v, k) => {
       if (!HOP_HEADERS.has(k.toLowerCase())) respHeaders[k] = v;
     });
-    item.res.writeHead(upstreamResp.status, respHeaders);
     const buf = Buffer.from(await upstreamResp.arrayBuffer());
-    item.res.end(buf);
+    if (withhold) {
+      // 服务端已处理并持久化成功，但响应暂不写回浏览器，稍后由
+      // deliverResponse 放行：确定性复现“保存成功但响应尚未回到页面”。
+      heldResponses.push({
+        res: item.res,
+        status: upstreamResp.status,
+        headers: respHeaders,
+        body: buf,
+      });
+    } else {
+      item.res.writeHead(upstreamResp.status, respHeaders);
+      item.res.end(buf);
+    }
     return { status: upstreamResp.status, body: JSON.parse(buf.toString("utf8") || "null") };
   }
 
@@ -195,7 +210,9 @@ async function startProxy(upstream) {
       return JSON.parse(held[index]?.body || "{}");
     },
     // releaseNext 放行最早挂起的分派请求：
-    //  - 'forward'：转发到真实服务（默认）；
+    //  - 'forward'：转发到真实服务并把响应写回浏览器（默认）；
+    //  - 'withhold'：转发到真实服务（服务照常处理并持久化），但暂不把响应
+    //    写回浏览器，稍后由 deliverNextResponse 放行；
     //  - {status, error}：由代理直接回失败响应（如保存失败 500）；
     //  - 'destroy'：直接中断连接，模拟无法连接服务。
     async releaseNext(action = "forward") {
@@ -215,13 +232,24 @@ async function startProxy(upstream) {
         }
         return null;
       }
-      if (action === "forward") {
-        return forward(item);
+      if (action === "forward" || action === "withhold") {
+        return forward(item, action === "withhold");
       }
       const payload = JSON.stringify({ error: action.error || "unable to save assignment" });
       item.res.writeHead(action.status || 500, { "Content-Type": "application/json; charset=utf-8" });
       item.res.end(payload);
       return null;
+    },
+    withheldResponseCount() {
+      return heldResponses.length;
+    },
+    // deliverNextResponse 把最早一条已在服务端处理完成、但暂未写回浏览器的
+    // 分派响应写回浏览器（响应保持服务端返回时的原样）。
+    deliverNextResponse() {
+      const parked = heldResponses.shift();
+      assert.ok(parked, "没有可放行的已暂存分派响应");
+      parked.res.writeHead(parked.status, parked.headers);
+      parked.res.end(parked.body);
     },
     async close() {
       for (const socket of sockets) socket.destroy();
