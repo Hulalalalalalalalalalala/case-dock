@@ -609,6 +609,19 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
           return t;
         });
         renderList();
+        // 详情仍打开时，把正在查看的同一张工单同步到本次合并后的内容：
+        // 负责人、最近处理时间与分派记录来自该工单在列表中的同一份数据，
+        // 分派记录保持原有发生顺序。只更新取值与记录，不动分派表单、
+        // 提示与按钮状态；详情已关闭、或本次列表已不包含该工单时保持原样。
+        if (detail.classList.contains("open") && current) {
+          for (var i=0;i<loaded.length;i++){
+            if (loaded[i].id === current.id) {
+              current = loaded[i];
+              fillDetail(current);
+              break;
+            }
+          }
+        }
       })
       .catch(function(err){
         // 读取失败不用空列表覆盖已有记录
