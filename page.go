@@ -590,6 +590,22 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
     }
   });
 
+  // syncDetailFromList 在一次列表读取成功后同步仍打开的详情：
+  // 只针对用户当时正在查看的那张工单（编号不变），用合并后的列表内容
+  // 刷新详情中的负责人、最近处理时间与分派记录；fillDetail 只更新取值，
+  // 不动分派表单的输入、提示与按钮状态。详情已关闭、或本次列表中已没有
+  // 该工单时保持原样，不重新打开详情、也不显示空详情。
+  function syncDetailFromList(){
+    if (!detail.classList.contains("open") || !current) return;
+    for (var i=0;i<loaded.length;i++){
+      if (loaded[i].id === current.id) {
+        current = loaded[i];
+        fillDetail(current);
+        return;
+      }
+    }
+  }
+
   function loadTickets(){
     return fetch("/api/tickets", {headers:{"Accept":"application/json"}})
       .then(function(resp){
@@ -609,6 +625,9 @@ dd{margin:0;white-space:pre-wrap;word-break:break-word;min-width:0}
           return t;
         });
         renderList();
+        // 列表更新后，若详情仍打开，同步当时正在查看的那张工单，
+        // 使详情与列表中该工单所在行显示同一份已合并的内容。
+        syncDetailFromList();
       })
       .catch(function(err){
         // 读取失败不用空列表覆盖已有记录
