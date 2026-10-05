@@ -49,6 +49,340 @@ fn run_sign_raw(args: &[&str]) -> Output {
     cmd.output().expect("failed to execute authnote")
 }
 
+/// Run `verify --key <key>` feeding `input` to standard input.
+fn run_verify(key: &str, input: &[u8]) -> Output {
+    let mut cmd = authnote();
+    cmd.arg("verify").arg("--key").arg(key);
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn authnote");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input)
+        .expect("failed to write record to stdin");
+    child.wait_with_output().expect("failed to await authnote")
+}
+
+/// Run `verify` with raw arguments and stdin (for option-error cases).
+fn run_verify_raw(args: &[&str], input: &[u8]) -> Output {
+    let mut cmd = authnote();
+    cmd.arg("verify");
+    for a in args {
+        cmd.arg(a);
+    }
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn authnote");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input)
+        .expect("failed to write to stdin");
+    child.wait_with_output().expect("failed to await authnote")
+}
+
+/// Sign a record and return its exact stdout bytes (including the newline).
+fn sign_record_bytes(key: &str, key_id: &str, version: &str, fields: &[&str]) -> Vec<u8> {
+    run_sign(key, key_id, version, fields).stdout
+}
+
+// ---------------------------------------------------------------------------
+// verify: success path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verify_accepts_the_record_sign_produces() {
+    let key = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+    let record = sign_record_bytes(key, "demo", "3", &["hello", "世界"]);
+    let out = run_verify(key, &record);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty(), "stderr must be empty, got {:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+}
+
+#[test]
+fn verify_tolerates_reserialization_reordering_and_whitespace() {
+    let key = "00112233445566778899aabbccddeeff";
+    let record = sign_record_bytes(key, "kid-名字", "7", &["中文🙂", "x y"]);
+
+    // Parse, then emit pretty JSON with members in reverse order.
+    let body = std::str::from_utf8(&record).unwrap().trim_end_matches('\n');
+    let parsed = Json::parse(body);
+    let obj = parsed.as_object();
+    let mut reordered = String::from("{\n");
+    for (i, (k, v)) in obj.iter().rev().enumerate() {
+        if i > 0 {
+            reordered.push_str(",\n");
+        }
+        reordered.push_str(&format!("  {k:?}: "));
+        reordered.push_str(&json_value_to_text(v));
+    }
+    reordered.push_str("\n}");
+    let padded = format!("  \t\n{reordered}\r\n  ");
+
+    let out = run_verify(key, padded.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+}
+
+/// Render a parsed Json back into compact JSON (test helper; records contain
+/// only objects/arrays/strings/integers).
+fn json_value_to_text(v: &Json) -> String {
+    fn escape(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+    match v {
+        Json::Str(s) => escape(s),
+        Json::Num(n) => n.to_string(),
+        Json::Arr(a) => format!(
+            "[{}]",
+            a.iter().map(json_value_to_text).collect::<Vec<_>>().join(",")
+        ),
+        Json::Obj(o) => format!(
+            "{{{}}}",
+            o.iter()
+                .map(|(k, v)| format!("{}:{}", escape(k), json_value_to_text(v)))
+                .collect::<Vec<_>>().join(",")
+        ),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+#[test]
+fn verify_distinct_encodings_and_unicode_escapes() {
+    let key = "00ff";
+    // Zero fields vs one empty field each verify with their own records.
+    let zero = sign_record_bytes(key, "id", "1", &[]);
+    let one_empty = sign_record_bytes(key, "id", "1", &[""]);
+    assert_eq!(run_verify(key, &zero).status.code(), Some(0));
+    assert_eq!(run_verify(key, &one_empty).status.code(), Some(0));
+
+    // A record whose Chinese text is written using \u escapes still verifies:
+    // verification runs over the decoded text, not the raw JSON spelling.
+    let rec = sign_record_bytes(key, "id", "1", &["世界"]);
+    let body = std::str::from_utf8(&rec).unwrap();
+    let escaped = body.replace("世界", "\\u4e16\\u754c");
+    let out = run_verify(key, escaped.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+
+    // Uppercase tag hex is accepted and still yields valid.
+    let body = String::from_utf8(rec).unwrap();
+    let parsed = Json::parse(body.trim_end_matches('\n'));
+    let upper_obj: Vec<(String, Json)> = parsed
+        .as_object()
+        .iter()
+        .map(|(k, v)| {
+            if k == "tag" {
+                (k.clone(), Json::Str(v.as_str().to_uppercase()))
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect();
+    let rebuilt = json_value_to_text(&Json::Obj(upper_obj)) + "\n";
+    let out = run_verify(key, rebuilt.as_bytes());
+    assert_eq!(out.status.code(), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// verify: mismatch path (exit 1, {"valid":false})
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verify_wrong_key_and_tampered_fields_exit_1() {
+    let key = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+    let record = sign_record_bytes(key, "demo", "3", &["hello", "世界"]);
+
+    // Wrong key: structurally fine, just doesn't authenticate.
+    let out = run_verify("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0c", &record);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stderr.is_empty());
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+
+    // Tampered field content / key id / version: each keeps legal JSON.
+    let body = std::str::from_utf8(&record).unwrap();
+    let variants = [
+        body.replace("hello", "hellp"),
+        body.replace("\"demo\"", "\"demo2\""),
+        body.replace("\"key_version\":3", "\"key_version\":4"),
+    ];
+    for rec_text in variants {
+        let out = run_verify(key, rec_text.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "expected mismatch, stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":false}\n");
+        assert!(out.stderr.is_empty());
+    }
+}
+
+#[test]
+fn verify_crossing_empty_field_encodings_fails() {
+    let key = "00ff";
+    let zero = sign_record_bytes(key, "id", "1", &[]);
+    let one_empty = sign_record_bytes(key, "id", "1", &[""]);
+
+    // Put the empty-field record's tag onto the zero-field record.
+    let zero_obj = Json::parse(std::str::from_utf8(&zero).unwrap().trim_end_matches('\n'));
+    let empty_tag = Json::parse(std::str::from_utf8(&one_empty).unwrap().trim_end_matches('\n'))
+        .get("tag")
+        .as_str()
+        .to_string();
+    let crossed: Vec<(String, Json)> = zero_obj
+        .as_object()
+        .iter()
+        .map(|(k, v)| {
+            if k == "tag" {
+                (k.clone(), Json::Str(empty_tag.clone()))
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect();
+    let out = run_verify(key, (json_value_to_text(&Json::Obj(crossed)) + "\n").as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+}
+
+// ---------------------------------------------------------------------------
+// verify: invalid record / invocation path (exit 2, empty stdout)
+// ---------------------------------------------------------------------------
+
+fn expect_verify_invalid(input: &[u8], args: &[&str]) -> String {
+    let out = run_verify_raw(args, input);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2, stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "stdout must be empty on exit 2");
+    let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+    assert!(!stderr.trim().is_empty(), "stderr must explain the problem");
+    stderr
+}
+
+#[test]
+fn verify_rejects_multiple_records_and_trailing_garbage() {
+    let key = "00ff";
+    let rec = sign_record_bytes(key, "id", "1", &["x"]);
+
+    let mut two = rec.clone();
+    two.extend_from_slice(&rec);
+    expect_verify_invalid(&two, &["--key", key]);
+
+    let mut with_word = rec.clone();
+    with_word.extend_from_slice(b" x");
+    expect_verify_invalid(&with_word, &["--key", key]);
+
+    let mut with_num = rec.clone();
+    with_num.extend_from_slice(b"42");
+    expect_verify_invalid(&with_num, &["--key", key]);
+
+    expect_verify_invalid(b"", &["--key", key]);
+    expect_verify_invalid(b"   \n\t", &["--key", key]);
+}
+
+#[test]
+fn verify_rejects_corrupt_and_ill_typed_records() {
+    let key = "00ff";
+    let bad: &[&[u8]] = &[
+        b"{",
+        b"[]",
+        b"\"x\"",
+        b"42",
+        br#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"]}"#,
+        br#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"","key_version":1,"fields":[],"tag":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        br#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":0,"fields":[],"tag":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        br#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":4294967296,"fields":[],"tag":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        br#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[1],"tag":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        br#"{"format":1,"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[],"tag":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        br#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[],"tag":"00"}"#,
+        br#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[],"tag":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}"#,
+    ];
+    for rec in bad {
+        expect_verify_invalid(rec, &["--key", key]);
+    }
+
+    // Non-UTF-8 input.
+    expect_verify_invalid(b"\xff\xff", &["--key", key]);
+}
+
+#[test]
+fn verify_reports_unsupported_format_and_algorithm_explicitly() {
+    let key = "00ff";
+    let tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let f2 = format!(
+        r#"{{"format":2,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[],"tag":"{tag}"}}"#
+    );
+    let a2 = format!(
+        r#"{{"format":1,"algorithm":"HMAC-SHA512","key_id":"id","key_version":1,"fields":[],"tag":"{tag}"}}"#
+    );
+    for rec in [f2, a2] {
+        let stderr = expect_verify_invalid(rec.as_bytes(), &["--key", key]);
+        assert!(
+            stderr.to_lowercase().contains("unsupported"),
+            "must explicitly say unsupported: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn verify_option_errors_match_sign_and_never_echo_secrets() {
+    let key = "00ff";
+    let rec = sign_record_bytes(key, "id", "1", &["x"]);
+    let secret = "deadbeefcafebabedeadbeefcafebabe";
+
+    expect_verify_invalid(&rec, &[]); // missing --key
+    expect_verify_invalid(&rec, &["--key"]); // missing value
+    expect_verify_invalid(&rec, &["--key", "abc"]); // odd hex
+    expect_verify_invalid(&rec, &["--key", "zz"]); // bad hex
+    expect_verify_invalid(&rec, &["--key", key, "--key", key]); // duplicate
+    expect_verify_invalid(&rec, &["--key", key, "--bogus", "x"]); // unknown
+    expect_verify_invalid(&rec, &["--key=zz"]); // inline bad hex
+
+    // A bad key value must not be echoed.
+    let stderr = expect_verify_invalid(&rec, &["--key", "abczz"]);
+    assert!(!stderr.contains("abczz"), "stderr echoed the key: {stderr}");
+
+    // A valid key on a later failing option must not leak either.
+    let stderr = expect_verify_invalid(&rec, &["--key", secret, "--bogus", "x"]);
+    assert!(!stderr.contains(secret), "stderr echoed the key: {stderr}");
+}
+
+
 // ---------------------------------------------------------------------------
 // Minimal JSON parser (objects, arrays, strings, integers, true/false/null).
 // ---------------------------------------------------------------------------
