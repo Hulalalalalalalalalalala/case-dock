@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::process::ExitCode;
 
 use hmac::{
@@ -13,22 +14,58 @@ const ALGORITHM: &str = "HMAC-SHA256";
 /// by different versions of the encoding can never collide.
 const DOMAIN_SEPARATOR: &[u8] = b"authnote-sign-v1";
 
+/// Every value-bearing option accepted by `sign`, in help order. Error
+/// messages name these fixed options but never echo user-supplied text.
+const KNOWN_OPTIONS: &str = "--key, --key-id, --key-version, --field";
+
+/// Decode one raw OS argument as UTF-8 text. Command-line text is processed
+/// strictly: a byte sequence that is not valid UTF-8 is a usage error, never
+/// a panic, and the offending bytes are not printed or replaced into the
+/// message.
+fn decode_arg(os: &OsStr) -> Result<String, String> {
+    os.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "an argument is not valid UTF-8 text".to_string())
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("--version") if args.len() == 1 => {
+    let raw: Vec<OsString> = env::args_os().skip(1).collect();
+    let Some(first) = raw.first() else {
+        return usage_error();
+    };
+    match first.to_str() {
+        Some("--version") if raw.len() == 1 => {
             println!("authnote 0.1.0");
             ExitCode::SUCCESS
         }
-        Some("sign") => sign(&args[1..]),
-        _ => {
-            eprintln!("Usage: authnote --version");
-            eprintln!(
-                "       authnote sign --key HEX --key-id ID --key-version N [--field TEXT]..."
-            );
-            ExitCode::from(2)
+        Some("sign") => {
+            // Decode strictly before parsing: one unreadable argument ends the
+            // run with a static message, so no bytes (key material included)
+            // ever reach a formatter.
+            let mut args = Vec::with_capacity(raw.len().saturating_sub(1));
+            for os in &raw[1..] {
+                match decode_arg(os) {
+                    Ok(s) => args.push(s),
+                    Err(msg) => {
+                        eprintln!("authnote sign: {msg}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            sign(&args)
         }
+        // Unknown subcommand/flag, or a non-UTF-8 first argument: static
+        // usage text, no input bytes echoed.
+        _ => usage_error(),
     }
+}
+
+fn usage_error() -> ExitCode {
+    eprintln!("Usage: authnote --version");
+    eprintln!(
+        "       authnote sign --key HEX --key-id ID --key-version N [--field TEXT]..."
+    );
+    ExitCode::from(2)
 }
 
 struct SignOptions {
@@ -119,8 +156,13 @@ fn parse_sign_args(args: &[String]) -> Result<SignOptions, String> {
                 let v = take_value(&mut i)?;
                 fields.push(v);
             }
-            other => {
-                return Err(format!("unknown option or argument: {other}"));
+            // Do not name the offending token: it can be a shifted secret
+            // (e.g. `--key-id --key SECRET ...` swallows the flag and leaves
+            // the secret as a positional). Point at the known options.
+            _ => {
+                return Err(format!(
+                    "unrecognized option or argument; expected one of: {KNOWN_OPTIONS}"
+                ));
             }
         }
         i += 1;

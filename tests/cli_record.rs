@@ -13,6 +13,7 @@
 //! The tests parse stdout with the small JSON parser below instead of pulling
 //! in a third-party dependency, so `Cargo.toml` stays unchanged.
 
+use std::ffi::OsString;
 use std::process::{Command, Output};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,36 @@ fn run_sign_raw(args: &[&str]) -> Output {
         cmd.arg(a);
     }
     cmd.output().expect("failed to execute authnote")
+}
+
+/// Run with a raw `OsString` vector, allowing invalid UTF-8 bytes to be
+/// delivered as individual arguments.
+fn run_raw_os(args: &[OsString]) -> Output {
+    let mut cmd = authnote();
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.output().expect("failed to execute authnote")
+}
+
+/// Assert the documented failure contract: exit 2, nothing on stdout, and a
+/// non-empty human-readable reason on valid-UTF-8 stderr.
+fn expect_clean_failure(out: &Output, label: &str) -> String {
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{label}: expected exit 2, got {:?}",
+        out.status.code()
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "{label}: stdout must be empty on error, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8(out.stderr.clone())
+        .unwrap_or_else(|_| panic!("{label}: stderr must be valid UTF-8"));
+    assert!(!stderr.trim().is_empty(), "{label}: stderr must explain the problem");
+    stderr
 }
 
 // ---------------------------------------------------------------------------
@@ -829,5 +860,201 @@ fn error_messages_never_echo_the_key() {
     assert!(
         !stderr.to_lowercase().contains(secret),
         "stderr echoed the key: {stderr}"
+    );
+}
+
+#[test]
+fn shifted_secret_after_value_like_option_is_never_echoed() {
+    let secret = "deadbeefcafebabedeadbeefcafebabe";
+
+    // `--key-id` swallows `--key` as its value; the secret then lands as a
+    // positional token. The old parser printed that token verbatim, leaking
+    // the key.
+    let stderr = expect_usage_error(&[
+        "--key-id", "--key", secret, "--key-version", "1",
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed shifted key: {stderr}");
+    assert!(
+        !stderr.to_lowercase().contains(secret),
+        "stderr echoed shifted key (case-folded): {stderr}"
+    );
+    // The message may point at known option names instead of the token.
+    assert!(stderr.contains("--key-id"), "stderr should name known options: {stderr}");
+    assert!(stderr.contains("--key-version"), "stderr should name known options: {stderr}");
+
+    // Same shift in the other direction: `--key-version` eats a following
+    // flag and displaces later values.
+    let stderr = expect_usage_error(&[
+        "--key", secret, "--key-id", "id", "--key-version",
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed shifted key: {stderr}");
+}
+
+#[test]
+fn key_not_echoed_around_unknown_options_in_either_form() {
+    let secret = "deadbeefcafebabedeadbeefcafebabe";
+
+    // Unknown option *before* the key is seen: following values must never be
+    // pulled into the message.
+    let stderr = expect_usage_error(&[
+        "--bogus", "--key", secret, "--key-id", "id", "--key-version", "1",
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed the key: {stderr}");
+
+    // Unknown option *after* the key.
+    let stderr = expect_usage_error(&[
+        "--key", secret, "--key-id", "id", "--key-version", "1", "--bogus", "x",
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed the key: {stderr}");
+
+    // The offending token itself (here: text that looks like a secret) must
+    // not be repeated, even with inline `--opt=value` spelling.
+    let stderr = expect_usage_error(&[
+        "--key", "00ff", "--key-id", "id", "--key-version", "1",
+        &format!("--bogus={secret}"),
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed the inline token: {stderr}");
+
+    // Duplicate key supplied through the `--key=HEX` spelling.
+    let stderr = expect_usage_error(&[
+        &format!("--key={secret}"), "--key", "00ff",
+        "--key-id", "id", "--key-version", "1",
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed the key: {stderr}");
+
+    // Rejected key in inline spelling must not be quoted back either.
+    let stderr = expect_usage_error(&[
+        "--key=abczzz", "--key-id", "id", "--key-version", "1",
+    ]);
+    assert!(!stderr.contains("abczzz"), "stderr echoed the key: {stderr}");
+}
+
+#[test]
+fn non_utf8_arguments_fail_with_exit_2_without_raw_bytes_or_panic() {
+    use std::os::unix::ffi::OsStringExt;
+    fn os(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    // Invalid UTF-8 in a standalone positional argument.
+    let out = run_raw_os(&[
+        OsString::from("sign"),
+        os(b"bad\xffbytes"),
+    ]);
+    let stderr = expect_clean_failure(&out, "positional");
+    assert!(stderr.contains("UTF-8"), "stderr should explain the decode failure: {stderr}");
+    assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
+
+    // Invalid UTF-8 inside an inline `--opt=value` argument.
+    let out = run_raw_os(&[
+        OsString::from("sign"),
+        os(b"--field=abc\xffdef"),
+    ]);
+    let stderr = expect_clean_failure(&out, "inline");
+    assert!(stderr.contains("UTF-8"), "stderr should explain the decode failure: {stderr}");
+
+    // Invalid bytes offered as the separated value for `--key`: the bytes
+    // themselves must never appear in the message.
+    let out = run_raw_os(&[
+        OsString::from("sign"),
+        OsString::from("--key"),
+        os(b"de\xFF"),
+        OsString::from("--key-id"),
+        OsString::from("id"),
+        OsString::from("--key-version"),
+        OsString::from("1"),
+    ]);
+    let stderr = expect_clean_failure(&out, "key-value");
+    assert!(stderr.contains("UTF-8"), "stderr should explain the decode failure: {stderr}");
+    assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
+
+    // A perfectly valid secret sitting next to an unreadable argument must
+    // not leak when decoding aborts parsing.
+    let secret = "deadbeefcafebabedeadbeefcafebabe";
+    let out = run_raw_os(&[
+        OsString::from("sign"),
+        OsString::from("--key"),
+        OsString::from(secret),
+        os(b"--field=ok\xff"),
+    ]);
+    let stderr = expect_clean_failure(&out, "beside-secret");
+    assert!(!stderr.contains(secret), "stderr echoed the key: {stderr}");
+
+    // Invalid UTF-8 where the subcommand itself should be: static usage text,
+    // no raw bytes, exit 2.
+    let out = run_raw_os(&[os(b"sign\xff")]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).expect("stderr must be valid UTF-8");
+    assert!(stderr.contains("Usage"));
+}
+
+#[test]
+fn secret_text_in_public_fields_is_preserved_on_success() {
+    // The no-echo rule applies to error messages only. On success the user
+    // may deliberately put the same text as the key into public fields or the
+    // key identifier; those values must survive character for character.
+    // This case cannot use `expect_signed_record`, which intentionally
+    // asserts the key never appears as a record value.
+    let secret = "00112233445566778899aabbccddeeff";
+    let fields = [
+        secret,
+        "prefix-00112233445566778899aabbccddeeff-suffix",
+        "--key=x-y",
+    ];
+    let out = run_sign(secret, secret, "1", &fields);
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stderr.is_empty());
+    let rec = parse_single_record(&out.stdout);
+    assert_eq!(rec.key_id, secret);
+    assert_eq!(
+        rec.fields,
+        fields.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+    );
+    // Independently computed with Python hmac/hashlib/struct.
+    assert_eq!(
+        rec.tag,
+        "87d56adb1b963cb5d776406f04e77dc97abb7d588b0408a2575b5716fbebe445"
+    );
+}
+
+#[test]
+fn mixed_value_forms_and_option_like_text_still_sign() {
+    // Separated and inline spelling may be mixed within one invocation.
+    let out = run_sign_raw(&[
+        "--key=00ff", "--key-id", "id", "--key-version=1",
+        "--field", "a", "--field=b",
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let rec = parse_single_record(&out.stdout);
+    assert_eq!(rec.fields, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(
+        rec.tag,
+        "a71b82e6f52f60d7cf05256cab2bc15742ff4b8f4f64fcea5e18033a0dbc370f"
+    );
+
+    // Text that merely looks like an option stays data when it is an
+    // option's value, including dashes, equals signs and `--field` itself.
+    let out = run_sign_raw(&[
+        "--key", "00ff", "--key-id", "i", "--key-version", "1",
+        "--field", "--key=not-a-key",
+        "--field", "plain-dash-text-x-y",
+        "--field", "--field",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stderr.is_empty());
+    let rec = parse_single_record(&out.stdout);
+    assert_eq!(
+        rec.fields,
+        vec![
+            "--key=not-a-key".to_string(),
+            "plain-dash-text-x-y".to_string(),
+            "--field".to_string(),
+        ]
+    );
+    assert_eq!(
+        rec.tag,
+        "39a6871a530eaee9c64494845ba3b9bd1f84a78ffda907cf469b626bfea5ef64"
     );
 }
