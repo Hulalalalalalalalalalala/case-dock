@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::io::Read;
 use std::process::ExitCode;
@@ -62,12 +63,112 @@ fn decode_args() -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Shared option parser for `sign` and `verify`.
+//
+// Both subcommands speak the same small option grammar, differing only in
+// which option names they accept:
+//
+//   * `--opt value` and `--opt=value` are both accepted and may be mixed.
+//     With `=`, the complete text after the first `=` is the value; further
+//     `=` characters stay part of the value. Without `=`, the immediately
+//     following argument is the value verbatim — even one that starts with
+//     `--` (a missing value is never silently replaced by an empty string).
+//   * Each option is either single-use (a second occurrence is an error) or
+//     repeatable (values are collected in occurrence order).
+//
+// The rules live here once; each command supplies its own table of known
+// options, so an option that belongs only to `sign` remains unknown to
+// `verify`. Error messages name only the known options of the command at
+// hand and never echo the offending argument or value.
+// ---------------------------------------------------------------------------
+
+/// Declares one option a subcommand accepts.
+struct OptionSpec {
+    /// Whether the option may be given more than once.
+    repeatable: bool,
+}
+
+/// Outcome of parsing one command's option list: every known option name maps
+/// to the values supplied for it, in order. Single-use options carry at most
+/// one value; `--field` is the only repeatable option.
+type ParsedOptions = HashMap<&'static str, Vec<String>>;
+
+/// Parse the arguments of one subcommand against its option table.
+///
+/// `known_options` lists exactly the options the command accepts;
+/// `unknown_message` is returned verbatim for anything else. Required-option
+/// and value checks are left to the caller so each command keeps its own
+/// validation order.
+fn parse_options(
+    args: &[String],
+    known_options: &[(&'static str, OptionSpec)],
+    unknown_message: &str,
+) -> Result<ParsedOptions, String> {
+    let mut values: ParsedOptions = HashMap::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        // Support both "--opt value" and "--opt=value" forms. Splitting on the
+        // first '=' only keeps any later '=' inside the value.
+        let (raw_name, inline_value) = match arg.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v)),
+            _ => (arg.as_str(), None),
+        };
+        // Match against the table to recover the option's 'static name; the
+        // option tables are four entries at most.
+        let (name, spec) = match known_options.iter().find(|(n, _)| *n == raw_name) {
+            Some((n, spec)) => (*n, spec),
+            None => return Err(unknown_message.to_string()),
+        };
+
+        let value = match inline_value {
+            Some(v) => v.to_string(),
+            None => {
+                // The next argument is the value verbatim, even if it looks
+                // like another option; a missing following argument is an
+                // error rather than an empty value.
+                i += 1;
+                match args.get(i) {
+                    Some(v) => v.clone(),
+                    None => return Err(format!("option {name} requires a value")),
+                }
+            }
+        };
+
+        let seen = values.entry(name).or_default();
+        if !spec.repeatable && !seen.is_empty() {
+            return Err(format!("option {name} must be given exactly once"));
+        }
+        seen.push(value);
+        i += 1;
+    }
+    Ok(values)
+}
+
+/// Remove the single value collected for a single-use option, if present.
+fn take_one<'a>(values: &'a mut ParsedOptions, name: &'static str) -> Option<String> {
+    values.get_mut(name).and_then(|v| v.pop())
+}
+
 struct SignOptions {
     key: String,
     key_id: String,
     key_version: String,
     fields: Vec<String>,
 }
+
+/// Options accepted by `sign`, in the order error messages list them.
+const SIGN_OPTIONS: &[(&str, OptionSpec)] = &[
+    ("--key", OptionSpec { repeatable: false }),
+    ("--key-id", OptionSpec { repeatable: false }),
+    ("--key-version", OptionSpec { repeatable: false }),
+    ("--field", OptionSpec { repeatable: true }),
+];
+
+const SIGN_UNKNOWN_MESSAGE: &str =
+    "unrecognized option or argument (known options: --key, --key-id, --key-version, --field)";
 
 fn sign(args: &[String]) -> ExitCode {
     match parse_sign_args(args).and_then(validate_sign_args) {
@@ -103,69 +204,13 @@ fn sign(args: &[String]) -> ExitCode {
 }
 
 fn parse_sign_args(args: &[String]) -> Result<SignOptions, String> {
-    let mut key: Option<String> = None;
-    let mut key_id: Option<String> = None;
-    let mut key_version: Option<String> = None;
-    let mut fields: Vec<String> = Vec::new();
-
-    let set_once = |slot: &mut Option<String>, name: &str, value: String| -> Result<(), String> {
-        if slot.is_some() {
-            return Err(format!("option {name} must be given exactly once"));
-        }
-        *slot = Some(value);
-        Ok(())
-    };
-
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        // Support both "--opt value" and "--opt=value" forms.
-        let (name, inline_value) = match arg.split_once('=') {
-            Some((n, v)) if n.starts_with("--") => (n, Some(v.to_string())),
-            _ => (arg.as_str(), None),
-        };
-        let take_value = |i: &mut usize| -> Result<String, String> {
-            if let Some(v) = inline_value {
-                return Ok(v);
-            }
-            *i += 1;
-            args.get(*i)
-                .cloned()
-                .ok_or_else(|| format!("option {name} requires a value"))
-        };
-        match name {
-            "--key" => {
-                let v = take_value(&mut i)?;
-                set_once(&mut key, "--key", v)?;
-            }
-            "--key-id" => {
-                let v = take_value(&mut i)?;
-                set_once(&mut key_id, "--key-id", v)?;
-            }
-            "--key-version" => {
-                let v = take_value(&mut i)?;
-                set_once(&mut key_version, "--key-version", v)?;
-            }
-            "--field" => {
-                let v = take_value(&mut i)?;
-                fields.push(v);
-            }
-            _ => {
-                // Never echo the unrecognized argument itself: it may be a
-                // misplaced secret (e.g. a key value whose option name was
-                // mistyped or whose value was consumed by another option).
-                return Err(
-                    "unrecognized option or argument (known options: --key, --key-id, --key-version, --field)"
-                        .to_string(),
-                );
-            }
-        }
-        i += 1;
-    }
-
-    let key = key.ok_or("missing required option --key")?;
-    let key_id = key_id.ok_or("missing required option --key-id")?;
-    let key_version = key_version.ok_or("missing required option --key-version")?;
+    let mut values = parse_options(args, SIGN_OPTIONS, SIGN_UNKNOWN_MESSAGE)?;
+    // Required options are checked in the same order as before.
+    let key = take_one(&mut values, "--key").ok_or("missing required option --key")?;
+    let key_id = take_one(&mut values, "--key-id").ok_or("missing required option --key-id")?;
+    let key_version = take_one(&mut values, "--key-version")
+        .ok_or("missing required option --key-version")?;
+    let fields = values.remove("--field").unwrap_or_default();
     Ok(SignOptions {
         key,
         key_id,
@@ -206,40 +251,14 @@ fn validate_key_hex(key: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn verify(args: &[String]) -> ExitCode {
-    // The option grammar for verify mirrors sign: "--opt value" or
-    // "--opt=value", exactly one --key, no other options. Values that fail are
-    // never echoed (they could be a mistyped secret).
-    let mut key: Option<String> = None;
-    let mut i = 0;
+    // verify speaks the same option grammar as sign but accepts only --key;
+    // every sign-only option is therefore reported as unrecognized here.
+    // Values that fail are never echoed (they could be a mistyped secret).
+    let known = &[("--key", OptionSpec { repeatable: false })];
+    let unknown_message = "unrecognized option or argument (the only known option is --key)";
     let parse = (|| -> Result<String, String> {
-        while i < args.len() {
-            let arg = &args[i];
-            let (name, inline_value) = match arg.split_once('=') {
-                Some((n, v)) if n.starts_with("--") => (n, Some(v.to_string())),
-                _ => (arg.as_str(), None),
-            };
-            if name != "--key" {
-                return Err(
-                    "unrecognized option or argument (the only known option is --key)"
-                        .to_string(),
-                );
-            }
-            let value = if let Some(v) = inline_value {
-                v
-            } else {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => v.clone(),
-                    None => return Err("option --key requires a value".to_string()),
-                }
-            };
-            if key.is_some() {
-                return Err("option --key must be given exactly once".to_string());
-            }
-            key = Some(value);
-            i += 1;
-        }
-        let key = key.ok_or("missing required option --key")?;
+        let mut values = parse_options(args, known, unknown_message)?;
+        let key = take_one(&mut values, "--key").ok_or("missing required option --key")?;
         validate_key_hex(&key)?;
         Ok(key)
     })();
