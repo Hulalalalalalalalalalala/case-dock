@@ -85,12 +85,18 @@ fn run_verify_raw(args: &[&str], input: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn authnote");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input)
-        .expect("failed to write to stdin");
+    // Every caller here drives an error path that exits before reading stdin
+    // (a malformed option), so the child may already be gone when we write; a
+    // BrokenPipe then simply reflects that early exit and must not fail the
+    // test. The outcome is still pinned by the exit code / stdout / stderr
+    // assertions after reaping the child.
+    if let Err(e) = child.stdin.take().unwrap().write_all(input) {
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "unexpected stdin write error: {e}"
+        );
+    }
     child.wait_with_output().expect("failed to await authnote")
 }
 
@@ -1244,4 +1250,280 @@ fn non_utf8_arguments_fail_with_exit_2_not_a_panic() {
     assert_eq!(out.status.code(), Some(2), "got {:?}", out.status.code());
     assert!(out.stdout.is_empty(), "stdout must be empty on error");
     assert!(!out.stderr.is_empty(), "stderr must explain the problem");
+}
+
+// ---------------------------------------------------------------------------
+// verify: records hand-authored as if produced by an *external* program that
+// only knows the published format 1 contract.
+//
+// `sign` is never invoked in this section, so a shared bug in this crate's
+// sign/verify pair cannot make these tests pass. Every tag is a golden value
+// computed independently with Python's hmac/hashlib/struct straight from the
+// byte recipe printed in README.md:
+//
+//   import hmac, hashlib, struct
+//   def encode(key_id, version, fields):
+//       out = b"authnote-sign-v1"
+//       kb = key_id.encode()
+//       out += struct.pack(">Q", len(kb)) + kb
+//       out += struct.pack(">I", version)
+//       out += struct.pack(">Q", len(fields))
+//       for f in fields:
+//           fb = f.encode()
+//           out += struct.pack(">Q", len(fb)) + fb
+//       return out
+//   hmac.new(bytes.fromhex(key), encode(key_id, version, fields),
+//            hashlib.sha256).hexdigest()
+//
+// The authenticated content exercises what cannot travel through a command
+// line: a NUL (U+0000) flanked by text inside a field, plus Chinese, emoji
+// (including a UTF-16 surrogate pair spelling) and real newlines.
+// ---------------------------------------------------------------------------
+
+
+/// Independent Python golden tag over:
+/// key `cafecafe...cafe`, key_id `密钥\n🙂`, version 42,
+/// fields [`前\u{0000}后`, `世界🙂\n第二行`, ``, `世界🙂\n第二行`].
+const EXT_KEY: &str = "cafecafecafecafecafecafecafecafe";
+const EXT_TAG: &str = "7474105d623bb03a81eb00b34545fcaf7a8c24002c5a6e58ecfdc6172e1d7f9c";
+
+/// Second external producer: key/key-id for the NUL-vs-empty-field goldens.
+const EXT2_KEY: &str = "0123456789abcdef";
+const EXT2_KID: &str = "外部记录";
+/// Golden tag for key_id `外部记录`, version 1, one field containing only NUL.
+const EXT2_NUL_TAG: &str = "cc556672a3f98087fd6dac8c8a8121f517101f784cb7d163cbe4aea5dfbfc559";
+/// Golden tag for the same record with the field being the empty string.
+const EXT2_EMPTY_TAG: &str = "79548ce691de6cf5ceeeae27190de8140604615becfd21022a0d34c365f2a0db";
+
+/// Substitute the golden-tag placeholder in a hand-written external record.
+fn with_tag(template: &str, tag: &str) -> String {
+    template.replace("@@TAG@@", tag)
+}
+
+fn expect_external_valid(record: &[u8], key: &str) {
+    let out = run_verify(key, record);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "expected valid, stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(
+        out.stderr.is_empty(),
+        "stderr must be empty on success, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn expect_external_mismatch(record: &[u8], key: &str) {
+    let out = run_verify(key, record);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected mismatch (exit 1), stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+    assert!(
+        out.stderr.is_empty(),
+        "stderr must be empty on mismatch, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn external_format1_records_with_nul_chinese_emoji_newline_verify() {
+    // Three legal JSON spellings of the SAME decoded record, all carrying the
+    // one Python golden tag. Re-spelling, member reordering and reformatting
+    // must not require regenerating the tag.
+
+    // (1) Pretty-printed, members in reverse order, padded with JSON
+    // whitespace; Chinese/emoji written directly, NUL as \u0000, newline as
+    // the short \n escape.
+    let pretty = with_tag(
+        r#"
+  {
+    "tag" : "@@TAG@@",
+    "fields" : [ "前\u0000后" , "世界🙂\n第二行", "", "世界🙂\n第二行" ],
+    "key_version" : 42,
+    "key_id" : "密钥\n🙂",
+    "algorithm" : "HMAC-SHA256",
+    "format" : 1
+  }
+"#,
+        EXT_TAG,
+    );
+    expect_external_valid(pretty.as_bytes(), EXT_KEY);
+
+    // (2) Compact, canonical member order, and pure ASCII on the wire: every
+    // non-ASCII scalar is a \u escape, the emoji (U+1F642) is spelled as its
+    // legal UTF-16 surrogate pair, and newlines use \u000a instead of the
+    // short \n. Inside the raw string every backslash is literal, so this is
+    // exactly the byte sequence an ASCII-only external producer emits; after
+    // JSON decoding it is identical to (1). Code points: 密 U+5BC6, 钥 U+94A5,
+    // 前 U+524D, 后 U+540E, 世 U+4E16, 界 U+754C, 第 U+7B2C, 二 U+4E8C,
+    // 行 U+884C, 🙂 = U+D83D U+DE42.
+    let fully_escaped = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"\u5bc6\u94a5\u000a\ud83d\ude42","key_version":42,"fields":["\u524d\u0000\u540e","\u4e16\u754c\ud83d\ude42\u000a\u7b2c\u4e8c\u884c","","\u4e16\u754c\ud83d\ude42\u000a\u7b2c\u4e8c\u884c"],"tag":"@@TAG@@"}"#,
+        EXT_TAG,
+    );
+    assert!(
+        fully_escaped.is_ascii(),
+        "variant (2) must be pure ASCII on the wire"
+    );
+    expect_external_valid(fully_escaped.as_bytes(), EXT_KEY);
+
+    // (3) Mixed/direct spelling: raw Chinese/emoji UTF-8, short \n for the
+    // newline, \u0000 for the NUL. Verification authenticates decoded text,
+    // so the conclusion must be byte-for-byte the same.
+    let mixed = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"密钥\n🙂","key_version":42,"fields":["前\u0000后","世界🙂\n第二行","","世界🙂\n第二行"],"tag":"@@TAG@@"}"#,
+        EXT_TAG,
+    );
+    expect_external_valid(mixed.as_bytes(), EXT_KEY);
+
+    // The same external record under the wrong key is a plain mismatch: the
+    // golden value proves the positive results above are not vacuous.
+    expect_external_mismatch(mixed.as_bytes(), "cafecafecafecafecafecafecafecafd");
+}
+
+#[test]
+fn nul_field_is_neither_empty_nor_truncating_in_external_records() {
+    // A field containing a single NUL authenticates differently from an empty
+    // field, even though both render as "" in many naive (C-string) toolkits.
+    let nul_only = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"外部记录","key_version":1,"fields":["\u0000"],"tag":"@@TAG@@"}"#,
+        EXT2_NUL_TAG,
+    );
+    let empty_only = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"外部记录","key_version":1,"fields":[""],"tag":"@@TAG@@"}"#,
+        EXT2_EMPTY_TAG,
+    );
+    expect_external_valid(nul_only.as_bytes(), EXT2_KEY);
+    expect_external_valid(empty_only.as_bytes(), EXT2_KEY);
+
+    // Cross-tagging the two records must fail: NUL is not silently decoded as
+    // the empty string.
+    let nul_with_empty_tag = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"外部记录","key_version":1,"fields":["\u0000"],"tag":"@@TAG@@"}"#,
+        EXT2_EMPTY_TAG,
+    );
+    expect_external_mismatch(nul_with_empty_tag.as_bytes(), EXT2_KEY);
+
+    // Text on either side of the NUL participates in the authenticated bytes.
+    // The main golden tag covers `前\u{0000}后` whole; dropping the text after
+    // or before the NUL while keeping the old tag is a mismatch, proving the
+    // NUL neither truncates the field nor hides its surrounding content.
+    let suffix_dropped = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"密钥\n🙂","key_version":42,"fields":["前\u0000","世界🙂\n第二行","","世界🙂\n第二行"],"tag":"@@TAG@@"}"#,
+        EXT_TAG,
+    );
+    let prefix_dropped = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"密钥\n🙂","key_version":42,"fields":["\u0000后","世界🙂\n第二行","","世界🙂\n第二行"],"tag":"@@TAG@@"}"#,
+        EXT_TAG,
+    );
+    expect_external_mismatch(suffix_dropped.as_bytes(), EXT_KEY);
+    expect_external_mismatch(prefix_dropped.as_bytes(), EXT_KEY);
+}
+
+#[test]
+fn changed_content_invalidates_old_external_tag() {
+    // Every variant stays structurally legal JSON and keeps the ORIGINAL
+    // golden tag; only the decoded content moves. Each must be exit 1, never
+    // exit 2 and never valid.
+
+    // Delete the NUL from `前\u{0000}后` (and nothing else).
+    let nul_deleted = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"密钥\n🙂","key_version":42,"fields":["前后","世界🙂\n第二行","","世界🙂\n第二行"],"tag":"@@TAG@@"}"#,
+        EXT_TAG,
+    );
+    expect_external_mismatch(nul_deleted.as_bytes(), EXT_KEY);
+
+    // Replace every real newline with the two literal characters backslash and
+    // 'n' (JSON "\\n"): that decodes to different text, not to a newline.
+    let literal_backslash_n = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"密钥\\n🙂","key_version":42,"fields":["前\u0000后","世界🙂\\n第二行","","世界🙂\\n第二行"],"tag":"@@TAG@@"}"#,
+        EXT_TAG,
+    );
+    expect_external_mismatch(literal_backslash_n.as_bytes(), EXT_KEY);
+
+    // Merge away the duplicated field: repeats must not be deduplicated.
+    let duplicate_collapsed = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"密钥\n🙂","key_version":42,"fields":["前\u0000后","世界🙂\n第二行",""],"tag":"@@TAG@@"}"#,
+        EXT_TAG,
+    );
+    expect_external_mismatch(duplicate_collapsed.as_bytes(), EXT_KEY);
+
+    // Drop the empty field: a different field count, with no join ambiguity.
+    let empty_dropped = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"密钥\n🙂","key_version":42,"fields":["前\u0000后","世界🙂\n第二行","世界🙂\n第二行"],"tag":"@@TAG@@"}"#,
+        EXT_TAG,
+    );
+    expect_external_mismatch(empty_dropped.as_bytes(), EXT_KEY);
+
+    // Reorder two fields: field order is authenticated.
+    let reordered = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"密钥\n🙂","key_version":42,"fields":["世界🙂\n第二行","前\u0000后","","世界🙂\n第二行"],"tag":"@@TAG@@"}"#,
+        EXT_TAG,
+    );
+    expect_external_mismatch(reordered.as_bytes(), EXT_KEY);
+}
+
+#[test]
+fn truncated_or_lone_unicode_escapes_are_corrupt_input_exit_2() {
+    let tag64 = "0".repeat(64);
+    let record = |fields_json: &str| -> String {
+        format!(
+            r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"{EXT2_KID}","key_version":1,{fields_json},"tag":"{tag64}"}}"#
+        )
+    };
+
+    // Truncated \u in the middle of a string, and cut off exactly at the end
+    // of the input (no closing quote either).
+    let truncated_mid = record(r#""fields":["\u000"]"#);
+    let truncated_at_eof =
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"外部记录","key_version":1,"fields":["\u00"#.to_string();
+    // Surrogate forms that never combine into one legal character.
+    let lone_high = record(r#""fields":["\ud83d"]"#);
+    let low_out_of_range = record(r#""fields":["\ud83dA"]"#);
+    let high_then_high = record(r#""fields":["\ud83d\ud83d"]"#);
+    let lone_low = record(r#""fields":["\ude42"]"#);
+    let bad_hex_digit = record(r#""fields":["\u00g0"]"#);
+
+    for (label, rec) in [
+        ("truncated escape", truncated_mid.as_str()),
+        ("truncated escape at EOF", truncated_at_eof.as_str()),
+        ("lone high surrogate", lone_high.as_str()),
+        ("low surrogate out of range", low_out_of_range.as_str()),
+        ("high surrogate paired with high", high_then_high.as_str()),
+        ("lone low surrogate", lone_low.as_str()),
+        ("non-hex digit in escape", bad_hex_digit.as_str()),
+    ] {
+        let stderr = expect_verify_invalid(rec.as_bytes(), &["--key", EXT2_KEY]);
+        // Error text explains the formatting problem but never quotes the key,
+        // record content, or the rejected escape's digits/value.
+        assert!(!stderr.contains(EXT2_KEY), "{label}: stderr echoed the key: {stderr}");
+        assert!(
+            !stderr.contains(EXT2_KID),
+            "{label}: stderr echoed record content: {stderr}"
+        );
+        assert!(
+            !stderr.as_bytes().contains(&0),
+            "{label}: stderr echoed a NUL byte: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("d83d") && !stderr.contains("de42"),
+            "{label}: stderr echoed the rejected escape value: {stderr}"
+        );
+    }
+
+    // A raw, unescaped NUL byte in the JSON text is corrupt input too: it may
+    // not be accepted as the escaped NUL and must not cut the string short.
+    let mut raw_nul = record(r#""fields":["前@后"]"#).into_bytes();
+    let at_pos = raw_nul.iter().position(|&b| b == b'@').unwrap();
+    raw_nul[at_pos] = 0;
+    let stderr = expect_verify_invalid(&raw_nul, &["--key", EXT2_KEY]);
+    assert!(!stderr.contains(EXT2_KEY), "stderr echoed the key: {stderr}");
+    assert!(!stderr.as_bytes().contains(&0), "stderr echoed the NUL: {stderr:?}");
 }
