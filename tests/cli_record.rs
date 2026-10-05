@@ -831,3 +831,83 @@ fn error_messages_never_echo_the_key() {
         "stderr echoed the key: {stderr}"
     );
 }
+
+#[test]
+fn unrecognized_arguments_are_never_echoed() {
+    let secret = "deadbeefcafebabedeadbeefcafebabe";
+
+    // The scenario from the field: `--key-id` is given without a value, so it
+    // consumes `--key` as its value, and the actual key string that follows
+    // becomes an unrecognized argument. The error must not repeat it.
+    let stderr = expect_usage_error(&["--key-id", "--key", secret, "--key-version", "1"]);
+    assert!(
+        !stderr.contains(secret),
+        "stderr echoed an unrecognized argument that was actually the key: {stderr}"
+    );
+
+    // Unknown option in the separate-value form.
+    let stderr = expect_usage_error(&[
+        "--key", "00ff", "--key-id", "id", "--key-version", "1", "--bogus", secret,
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed input: {stderr}");
+
+    // Unknown option in the --opt=value form: neither name nor value may leak.
+    let stderr = expect_usage_error(&[
+        "--key", "00ff", "--key-id", "id", "--key-version", "1",
+        &format!("--bogus={secret}"),
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed input: {stderr}");
+    assert!(!stderr.contains("--bogus"), "stderr echoed input: {stderr}");
+
+    // A bare positional argument must not be echoed either.
+    let stderr = expect_usage_error(&[
+        "--key", "00ff", "--key-id", "id", "--key-version", "1", secret,
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed input: {stderr}");
+
+    // A key given via --key=HEX must stay secret when a *later* argument fails.
+    let stderr = expect_usage_error(&[
+        &format!("--key={secret}"), "--key-id", "id", "--key-version", "1", "--bogus",
+    ]);
+    assert!(!stderr.contains(secret), "stderr echoed the key: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_arguments_fail_with_exit_2_not_a_panic() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // 0xFF is never valid UTF-8.
+    let bad = OsStr::from_bytes(b"\xff\xfe");
+
+    // An undecodable argument anywhere in the sign command line.
+    let out = authnote()
+        .arg("sign")
+        .arg("--key")
+        .arg("00ff")
+        .arg("--key-id")
+        .arg("id")
+        .arg("--key-version")
+        .arg("1")
+        .arg(bad)
+        .output()
+        .expect("failed to execute authnote");
+    assert_eq!(out.status.code(), Some(2), "got {:?}", out.status.code());
+    assert!(out.stdout.is_empty(), "stdout must be empty on error");
+    let stderr = String::from_utf8(out.stderr).expect("stderr must be valid UTF-8");
+    assert!(!stderr.trim().is_empty(), "stderr must explain the problem");
+    assert!(
+        !stderr.contains('\u{fffd}'),
+        "stderr must not contain replacement characters from lossy decoding: {stderr}"
+    );
+
+    // An undecodable argument before any subcommand fails the same way.
+    let out = authnote()
+        .arg(bad)
+        .output()
+        .expect("failed to execute authnote");
+    assert_eq!(out.status.code(), Some(2), "got {:?}", out.status.code());
+    assert!(out.stdout.is_empty(), "stdout must be empty on error");
+    assert!(!out.stderr.is_empty(), "stderr must explain the problem");
+}

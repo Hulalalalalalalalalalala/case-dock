@@ -14,7 +14,13 @@ const ALGORITHM: &str = "HMAC-SHA256";
 const DOMAIN_SEPARATOR: &[u8] = b"authnote-sign-v1";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = match decode_args() {
+        Ok(args) => args,
+        Err(msg) => {
+            eprintln!("authnote: {msg}");
+            return ExitCode::from(2);
+        }
+    };
     match args.first().map(String::as_str) {
         Some("--version") if args.len() == 1 => {
             println!("authnote 0.1.0");
@@ -29,6 +35,28 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Decode the process arguments (excluding the program name) as UTF-8 text.
+///
+/// `env::args()` panics on arguments that are not valid UTF-8; decoding via
+/// `args_os()` lets us report the problem as an ordinary usage error instead.
+/// The raw bytes are never printed: the message only states *that* an
+/// argument could not be decoded, not what it contained.
+fn decode_args() -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for (index, arg) in env::args_os().skip(1).enumerate() {
+        match arg.into_string() {
+            Ok(s) => out.push(s),
+            Err(_) => {
+                return Err(format!(
+                    "argument {} is not valid UTF-8 text; all arguments must be decodable text",
+                    index + 1
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 struct SignOptions {
@@ -119,8 +147,14 @@ fn parse_sign_args(args: &[String]) -> Result<SignOptions, String> {
                 let v = take_value(&mut i)?;
                 fields.push(v);
             }
-            other => {
-                return Err(format!("unknown option or argument: {other}"));
+            _ => {
+                // Never echo the unrecognized argument itself: it may be a
+                // misplaced secret (e.g. a key value whose option name was
+                // mistyped or whose value was consumed by another option).
+                return Err(
+                    "unrecognized option or argument (known options: --key, --key-id, --key-version, --field)"
+                        .to_string(),
+                );
             }
         }
         i += 1;
