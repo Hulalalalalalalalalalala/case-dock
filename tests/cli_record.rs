@@ -1527,3 +1527,195 @@ fn truncated_or_lone_unicode_escapes_are_corrupt_input_exit_2() {
     assert!(!stderr.contains(EXT2_KEY), "stderr echoed the key: {stderr}");
     assert!(!stderr.as_bytes().contains(&0), "stderr echoed the NUL: {stderr:?}");
 }
+
+// ---------------------------------------------------------------------------
+// verify: member names are recognized by their JSON-DECODED text.
+//
+// Records here mimic an external program that saves or reformats a single
+// record and happens to spell ASCII member names with backslash-u escapes.
+// Tags come from a record `sign` produced (format-1 content is unchanged), so
+// these tests pin only the member-name recognition behavior. Every assertion
+// is on the observable contract: exit code, the one stdout line and stderr.
+// ---------------------------------------------------------------------------
+
+/// Spelling used below for "i" (U+0069), "a" (U+0061) and "_" (U+005F).
+/// The constants are raw-string fragments built so the JSON wire bytes are
+/// exactly the six characters backslash-u-hexhexhexhex.
+mod esc_name {
+    pub const I: &str = r"\u0069"; // 'i'
+    pub const A: &str = r"\u0061"; // 'a'
+    pub const US: &str = r"\u005f"; // '_'
+}
+
+#[test]
+fn verify_accepts_escaped_spellings_of_member_names() {
+    let key = "00ff";
+    let record = sign_record_bytes(key, "id", "1", &["x", "x"]);
+    let body = std::str::from_utf8(&record).unwrap().trim_end_matches('\n');
+
+    // (1) Rename key_id, fields and tag to their equivalent escaped spellings;
+    // decoded names and all values are untouched. Duplicate TEXT in the
+    // fields array ("x","x") is field content, not a member, and is preserved.
+    let escaped = body
+        .replace("\"key_id\"", &format!("\"key_{}d\"", esc_name::I))
+        .replace("\"fields\"", &format!("\"f{}elds\"", esc_name::I))
+        .replace("\"tag\"", &format!("\"t{}g\"", esc_name::A));
+    let out = run_verify(key, escaped.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty(), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+
+    // (2) The same legal rewrite under the WRONG key is an authentication
+    // mismatch, not a structural error.
+    let out = run_verify("ff00", escaped.as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+    assert!(out.stderr.is_empty());
+
+    // (3) Escaped and direct spellings mixed, members reordered and the
+    // document reformatted with JSON whitespace.
+    let tag = Json::parse(body).get("tag").as_str().to_string();
+    let reordered = format!(
+        "{{\n  \"f{i}elds\" : [\"x\", \"x\"] ,\n  \"t{a}g\" : \"{tag}\",\n  \
+         \"format\": 1,\n  \"algorithm\": \"HMAC-SHA256\",\n  \"key_{i}d\": \"id\",\n  \
+         \"key_version\": 1\n}}\n",
+        i = esc_name::I,
+        a = esc_name::A,
+        tag = tag
+    );
+    let out = run_verify(key, reordered.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // (4) An escape in the MIDDLE of the name ("ke" + U+0079 'y') decodes to
+    // exactly "key_id" as well.
+    let mid = body.replace("\"key_id\"", "\"ke\\u0079_id\"");
+    let out = run_verify(key, mid.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_rejects_names_duplicate_after_decoding_with_exit_2() {
+    let key = "00ff";
+    let record = sign_record_bytes(key, "id", "1", &["x"]);
+    let body = std::str::from_utf8(&record).unwrap().trim_end_matches('\n');
+    let tag = Json::parse(body).get("tag").as_str().to_string();
+    let zeroes = "0".repeat(64);
+    let i = esc_name::I;
+    let a = esc_name::A;
+
+    // Every record carries two member names that decode to the same documented
+    // member. Whichever spelling is first, whether the values agree or differ,
+    // and even when one value/tag authenticates, the outcome must be exit 2
+    // with empty stdout and a duplicate-member explanation: never first/last
+    // wins and never a {"valid":false} mismatch verdict.
+    let records: Vec<String> = vec![
+        // key_id duplicated, equal values, direct spelling first.
+        format!(
+            r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_{i}d":"id","key_version":1,"fields":["x"],"tag":"{tag}"}}"#
+        ),
+        // key_id duplicated, escaped first, DIFFERENT values; tag matches the
+        // first value ("id").
+        format!(
+            r#"{{"format":1,"algorithm":"HMAC-SHA256","key_{i}d":"id","key_id":"other","key_version":1,"fields":["x"],"tag":"{tag}"}}"#
+        ),
+        // fields duplicated with agreeing arrays and a matching tag.
+        format!(
+            r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"f{i}elds":["x"],"tag":"{tag}"}}"#
+        ),
+        // fields duplicated with DISAGREEING arrays; tag matches only the
+        // first array.
+        format!(
+            r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"f{i}elds":["y"],"tag":"{tag}"}}"#
+        ),
+        // tag duplicated with equal values.
+        format!(
+            r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"tag":"{tag}","t{a}g":"{tag}"}}"#
+        ),
+        // tag duplicated with the MATCHING tag in the SECOND slot.
+        format!(
+            r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"t{a}g":"{zeroes}","tag":"{tag}"}}"#
+        ),
+    ];
+
+    for rec in records {
+        let out = run_verify(key, rec.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "duplicate decoded member must exit 2 for {rec}, got {:?}",
+            out.status.code()
+        );
+        assert!(out.stdout.is_empty(), "stdout must be empty, got {:?}", String::from_utf8_lossy(&out.stdout));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.to_lowercase().contains("duplicate"),
+            "stderr must explain the duplicate member: {stderr}"
+        );
+        // Error text follows the standing convention: no key, record content,
+        // tag or rejected member spelling is quoted back.
+        assert!(!stderr.contains(key), "stderr echoed the key: {stderr}");
+        assert!(!stderr.contains(&tag), "stderr echoed the tag: {stderr}");
+        assert!(!stderr.contains("0069") && !stderr.contains("0061"),
+            "stderr echoed the rejected member spelling: {stderr}");
+    }
+}
+
+#[test]
+fn verify_decoded_member_names_must_match_exactly() {
+    let key = "00ff";
+    let record = sign_record_bytes(key, "id", "1", &["x"]);
+    let body = std::str::from_utf8(&record).unwrap().trim_end_matches('\n');
+    let tag = Json::parse(body).get("tag").as_str().to_string();
+    let i = esc_name::I;
+
+    // Case and surrounding whitespace are not corrected, and an escape that
+    // yields almost-but-not-quite a known name does not make the surplus name
+    // legal. Each record stands in for key_id, so the record cannot verify:
+    // exit 2 with empty stdout.
+    let misspelled_names = [
+        "\"Key_id\"",
+        "\"key_Id\"",
+        "\"key_id \"",
+        "\" key_id\"",
+        "\"key_id\\u0009\"", // trailing TAB produced by the escape
+        &format!("\"ke{us}x{i}d\"", us = esc_name::US, i = i), // decodes to "ke_xid": not key_id
+    ];
+    for bad in misspelled_names {
+        let rec = format!(
+            r#"{{"format":1,"algorithm":"HMAC-SHA256",{bad}:"id","key_version":1,"fields":["x"],"tag":"{tag}"}}"#
+        );
+        let out = run_verify(key, rec.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "misspelled member {bad} must exit 2, got {:?}",
+            out.status.code()
+        );
+        assert!(out.stdout.is_empty());
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!stderr.trim().is_empty(), "stderr must explain the structure problem");
+        assert!(!stderr.contains(key), "stderr echoed the key: {stderr}");
+        assert!(!stderr.contains(&tag), "stderr echoed the tag: {stderr}");
+    }
+
+    // All six documented members present, plus a surplus member whose name is
+    // written entirely with escapes ("extra" + U+005F + "name"): escaping does
+    // not legitimize it, and it must not be ignored to reach a verdict.
+    let extra = format!(
+        r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"tag":"{tag}","extra{us}name":1}}"#,
+        us = esc_name::US
+    );
+    let out = run_verify(key, extra.as_bytes());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!stderr.trim().is_empty());
+    assert!(!stderr.contains(key), "stderr echoed the key: {stderr}");
+    assert!(!stderr.contains(&tag), "stderr echoed the tag: {stderr}");
+    assert!(!stderr.contains("005f"), "stderr echoed the rejected member name: {stderr}");
+    assert!(!stderr.contains("extra"), "stderr echoed the rejected member name: {stderr}");
+}

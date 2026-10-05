@@ -1159,4 +1159,169 @@ mod tests {
         assert!(parse_single("\"\\x\"").is_err());
         assert!(parse_single("\"\n\"").is_err()); // raw control character
     }
+
+    /// Substitute the tag placeholder in a hand-written record template.
+    fn with_tag(template: &str, tag: &str) -> String {
+        template.replace("@@TAG@@", tag)
+    }
+
+    #[test]
+    fn verify_matches_member_names_after_unicode_unescaping() {
+        let key = "00ff";
+
+        // Renaming the documented members to equivalent backslash-u-escaped
+        // spellings must leave a valid record valid: recognition runs on the
+        // DECODED names. key_\u0069d decodes to "key_id", f\u0069elds to
+        // "fields" and t\u0061g to "tag".
+        let tag = sign_tag(key, "id", 1, &["x", "x"]);
+        let escaped_names = with_tag(
+            r#"{"format":1,"algorithm":"HMAC-SHA256","key_\u0069d":"id","key_version":1,"f\u0069elds":["x","x"],"t\u0061g":"@@TAG@@"}"#,
+            &tag,
+        );
+        assert!(matches!(
+            verify_input(escaped_names.as_bytes(), key),
+            VerifyOutcome::Valid
+        ));
+
+        // Escaped and direct spellings may be mixed in one object, whitespace
+        // may change and member order is irrelevant: escaped fields/tag first,
+        // direct members after, key_version trailing.
+        let tag1 = sign_tag(key, "id", 1, &["x"]);
+        let mixed = with_tag(
+            r#"{
+  "f\u0069elds" : ["x"] ,
+  "t\u0061g" : "@@TAG@@",
+  "format": 1,
+  "algorithm": "HMAC-SHA256",
+  "key_id": "id",
+  "key_version": 1
+}"#,
+            &tag1,
+        );
+        assert!(matches!(
+            verify_input(mixed.as_bytes(), key),
+            VerifyOutcome::Valid
+        ));
+
+        // An escape in the middle of a name is no different: "ke" + U+0079
+        // ('y') + "_id" decodes to exactly "key_id".
+        let mid_escape = with_tag(
+            r#"{"format":1,"algorithm":"HMAC-SHA256","ke\u0079_id":"id","key_version":1,"fields":["x"],"tag":"@@TAG@@"}"#,
+            &tag1,
+        );
+        assert!(matches!(
+            verify_input(mid_escape.as_bytes(), key),
+            VerifyOutcome::Valid
+        ));
+
+        // Repeated text inside the fields array is field *content*, not an
+        // object member: it is preserved and never treated as a duplicate.
+        let dup_fields = record_for(key, "id", 1, &["dup", "dup"]);
+        assert!(matches!(
+            verify_input(dup_fields.as_bytes(), key),
+            VerifyOutcome::Valid
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_members_duplicate_after_name_unescaping() {
+        let key = "00ff";
+        let tag = sign_tag(key, "id", 1, &["x"]);
+        let zeroes = "0".repeat(64);
+
+        // Two member names that differ on the wire but decode to the same text
+        // are duplicate members: corrupt records (exit 2), regardless of which
+        // spelling comes first, whether the values agree, and even when one
+        // value matches the tag. None may become Valid or Mismatch.
+        let duplicate_records = [
+            // key_id duplicated, same value, direct spelling first.
+            with_tag(
+                r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_\u0069d":"id","key_version":1,"fields":["x"],"tag":"@@TAG@@"}"#,
+                &tag,
+            ),
+            // Escaped spelling first, different values; the tag matches the
+            // FIRST value ("id"): no first-wins verification.
+            with_tag(
+                r#"{"format":1,"algorithm":"HMAC-SHA256","key_\u0069d":"id","key_id":"other","key_version":1,"fields":["x"],"tag":"@@TAG@@"}"#,
+                &tag,
+            ),
+            // fields duplicated with agreeing arrays and a matching tag.
+            with_tag(
+                r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"f\u0069elds":["x"],"tag":"@@TAG@@"}"#,
+                &tag,
+            ),
+            // fields duplicated with DISAGREEING arrays; the tag matches only
+            // the FIRST one.
+            with_tag(
+                r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"f\u0069elds":["y"],"tag":"@@TAG@@"}"#,
+                &tag,
+            ),
+            // tag duplicated with the same tag string in both slots.
+            with_tag(
+                r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"tag":"@@TAG@@","t\u0061g":"@@TAG@@"}"#,
+                &tag,
+            ),
+            // tag duplicated with the matching tag in the SECOND slot: no
+            // last-wins verification either.
+            with_tag(
+                r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"t\u0061g":"§ZERO§","tag":"@@TAG@@"}"#
+                    .replace("§ZERO§", &zeroes)
+                    .as_str(),
+                &tag,
+            ),
+        ];
+        for rec in duplicate_records {
+            match verify_input(rec.as_bytes(), key) {
+                VerifyOutcome::Invalid(msg) => {
+                    assert!(
+                        msg.contains("duplicate"),
+                        "message must explain the duplicate member, got: {msg}"
+                    );
+                }
+                other => panic!("expected Invalid(duplicate), got {other:?} for {rec}"),
+            }
+        }
+    }
+
+    #[test]
+    fn verify_member_name_matching_is_exact_after_unescaping() {
+        let key = "00ff";
+        let tag = sign_tag(key, "id", 1, &["x"]);
+
+        // Unescaping never turns a surplus name into a known member, and case
+        // or surrounding whitespace is not corrected. Each record carries the
+        // misspelled name in place of key_id (so it also lacks key_id): it is
+        // a structure problem (exit 2), not a verifiable record.
+        let misspelled = [
+            r#""Key_id""#,      // wrong case
+            r#""key_Id""#,      // wrong case in the middle
+            r#""key_id ""#,     // trailing space
+            r#"" key_id""#,     // leading space
+            r#""key_id\u0009""#, // trailing TAB produced by the escape
+            r#""ke\u0079_id_""#, // decodes to "key_id_": an extra underscore
+        ];
+        for bad in misspelled {
+            let rec = with_tag(
+                &format!(
+                    r#"{{"format":1,"algorithm":"HMAC-SHA256",{bad}:"id","key_version":1,"fields":["x"],"tag":"@@TAG@@"}}"#
+                ),
+                &tag,
+            );
+            match verify_input(rec.as_bytes(), key) {
+                VerifyOutcome::Invalid(_) => {}
+                other => panic!("expected Invalid for member {bad}, got {other:?}"),
+            }
+        }
+
+        // Every known member present AND a surplus escaped name: the extra one
+        // is still fatal; it is not ignored to reach an authentication verdict.
+        let with_extra = with_tag(
+            r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":["x"],"tag":"@@TAG@@","extra\u005fname":1}"#,
+            &tag,
+        );
+        assert!(matches!(
+            verify_input(with_extra.as_bytes(), key),
+            VerifyOutcome::Invalid(_)
+        ));
+    }
 }
