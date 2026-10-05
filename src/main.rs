@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Read;
 use std::process::ExitCode;
 
 use hmac::{
@@ -27,11 +28,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("sign") => sign(&args[1..]),
+        Some("verify") => verify(&args[1..]),
         _ => {
             eprintln!("Usage: authnote --version");
             eprintln!(
                 "       authnote sign --key HEX --key-id ID --key-version N [--field TEXT]..."
             );
+            eprintln!("       authnote verify --key HEX");
             ExitCode::from(2)
         }
     }
@@ -97,6 +100,590 @@ fn sign(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// verify: authenticate exactly one signed record read from standard input.
+// ---------------------------------------------------------------------------
+
+struct VerifyOptions {
+    key: String,
+}
+
+fn verify(args: &[String]) -> ExitCode {
+    // Argument errors follow the same conventions as `sign` (exit 2, message
+    // that never echoes the key or any rejected value).
+    let opts = match parse_verify_args(args) {
+        Ok(opts) => opts,
+        Err(msg) => {
+            eprintln!("authnote verify: {msg}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // JSON is a byte-oriented text format: read raw bytes and require valid
+    // UTF-8 rather than silently lossy-decoding the record.
+    let mut input = Vec::new();
+    if let Err(e) = std::io::stdin().read_to_end(&mut input) {
+        eprintln!("authnote verify: failed to read standard input: {e}");
+        return ExitCode::from(2);
+    }
+
+    let outcome: Result<bool, String> = (|| {
+        let record = parse_record(&input)?;
+        let key_bytes = decode_hex(&opts.key).expect("key was validated as hex");
+        let message = encode_message(&record.key_id, record.key_version, &record.fields);
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key_bytes)
+            .expect("HMAC accepts keys of any length");
+        mac.update(&message);
+        let expected = mac.finalize().into_bytes();
+        let given = decode_hex(&record.tag).expect("tag was validated as 64 hex chars");
+        // Either the whole record matches the key or it does not; the result
+        // never claims which part moved or whether the key was wrong.
+        Ok(constant_time_eq(&given, &expected))
+    })();
+
+    match outcome {
+        Ok(valid) => {
+            println!("{{\"valid\":{valid}}}");
+            if valid {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(msg) => {
+            eprintln!("authnote verify: {msg}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Parse the verify command line: `--key HEX` is the only option, exactly once.
+fn parse_verify_args(args: &[String]) -> Result<VerifyOptions, String> {
+    let mut key: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        // Support both "--opt value" and "--opt=value" forms, like sign.
+        let (name, inline_value) = match arg.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        let take_value = |i: &mut usize| -> Result<String, String> {
+            if let Some(v) = inline_value {
+                return Ok(v);
+            }
+            *i += 1;
+            args.get(*i)
+                .cloned()
+                .ok_or_else(|| format!("option {name} requires a value"))
+        };
+        match name {
+            "--key" => {
+                let v = take_value(&mut i)?;
+                if key.is_some() {
+                    return Err("option --key must be given exactly once".to_string());
+                }
+                key = Some(v);
+            }
+            _ => {
+                // Never echo the unrecognized argument: like sign, it may be a
+                // misplaced secret.
+                return Err(
+                    "unrecognized option or argument (known options: --key)".to_string(),
+                );
+            }
+        }
+        i += 1;
+    }
+
+    let key = key.ok_or("missing required option --key")?;
+    if key.is_empty()
+        || key.len() % 2 != 0
+        || !key.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("--key must be a non-empty, even-length hexadecimal string".to_string());
+    }
+    Ok(VerifyOptions { key })
+}
+
+/// A structurally valid format-1 record. Field order and repeats are preserved
+/// exactly as decoded; reformatting or reordering object members does not
+/// change the authenticated content.
+struct SignedRecord {
+    key_id: String,
+    key_version: u32,
+    fields: Vec<String>,
+    tag: String,
+}
+
+/// Parse exactly one JSON record from the raw stdin bytes.
+///
+/// JSON whitespace is permitted before and after the single object, but
+/// nothing else: an empty input, several objects or trailing non-whitespace
+/// data are all rejected rather than authenticating the first object.
+fn parse_record(input: &[u8]) -> Result<SignedRecord, String> {
+    let text = std::str::from_utf8(input)
+        .map_err(|_| "malformed JSON record: input is not valid UTF-8 text".to_string())?;
+    let mut parser = JsonParser {
+        chars: text.chars().collect(),
+        pos: 0,
+    };
+    parser.skip_ws();
+    if parser.pos == parser.chars.len() {
+        return Err("malformed JSON record: standard input is empty".to_string());
+    }
+    let value = parser.parse_value()?;
+    parser.skip_ws();
+    if parser.pos != parser.chars.len() {
+        return Err(
+            "malformed JSON record: expected exactly one JSON value with only surrounding whitespace, found trailing non-whitespace data"
+                .to_string(),
+        );
+    }
+    validate_record(value)
+}
+
+/// Compare two equal-length byte strings without short-circuiting, so the
+/// exit path does not leak how many tag bytes matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// Minimal strict JSON parser (RFC 8259 grammar; no third-party dependency).
+//
+// Deliberately stricter than a general-purpose parser in the ways the record
+// contract needs: duplicate object members are rejected, only the four JSON
+// whitespace characters count as whitespace, numbers must follow the grammar
+// (no leading zeros, fractions/exponents still parsed so they can be reported
+// as type errors), and raw control characters or unpaired surrogates in
+// strings are rejected. Parse errors never quote the input.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum Json {
+    Null,
+    // Retained for parser completeness; records carry no boolean values.
+    #[allow(dead_code)]
+    Bool(bool),
+    /// Verbose spelling retained so callers can distinguish integers from
+    /// fractional/exponential numbers when the record requires an integer.
+    Num(String),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+struct JsonParser {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl JsonParser {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += 1;
+        Some(c)
+    }
+
+    /// RFC 8259 whitespace: space, tab, LF, CR only.
+    fn skip_ws(&mut self) {
+        while let Some(c) = self.peek() {
+            if matches!(c, ' ' | '\t' | '\n' | '\r') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn parse_value(&mut self) -> Result<Json, String> {
+        self.skip_ws();
+        match self.peek() {
+            Some('{') => Ok(Json::Obj(self.parse_object()?)),
+            Some('[') => Ok(Json::Arr(self.parse_array()?)),
+            Some('"') => Ok(Json::Str(self.parse_string()?)),
+            Some('t') => self.parse_literal("true", Json::Bool(true)),
+            Some('f') => self.parse_literal("false", Json::Bool(false)),
+            Some('n') => self.parse_literal("null", Json::Null),
+            Some(c) if c == '-' || c.is_ascii_digit() => Ok(Json::Num(self.parse_number()?)),
+            Some(_) => Err("malformed JSON record: unexpected token".to_string()),
+            None => Err("malformed JSON record: unexpected end of input".to_string()),
+        }
+    }
+
+    fn parse_literal(&mut self, want: &str, value: Json) -> Result<Json, String> {
+        for expected in want.chars() {
+            if self.bump() != Some(expected) {
+                return Err(format!("malformed JSON record: invalid literal (expected {want})"));
+            }
+        }
+        Ok(value)
+    }
+
+    fn parse_object(&mut self) -> Result<Vec<(String, Json)>, String> {
+        self.bump(); // opening '{'
+        let mut entries = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some('}') {
+            self.bump();
+            return Ok(entries);
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some('"') {
+                return Err("malformed JSON record: expected a string member name".to_string());
+            }
+            let key = self.parse_string()?;
+            if entries.iter().any(|(k, _)| k == &key) {
+                return Err(
+                    "malformed JSON record: object contains a duplicate member".to_string(),
+                );
+            }
+            self.skip_ws();
+            if self.bump() != Some(':') {
+                return Err("malformed JSON record: expected ':' after member name".to_string());
+            }
+            let value = self.parse_value()?;
+            entries.push((key, value));
+            self.skip_ws();
+            match self.bump() {
+                Some(',') => continue,
+                Some('}') => break,
+                _ => return Err("malformed JSON record: expected ',' or '}' in object".to_string()),
+            }
+        }
+        Ok(entries)
+    }
+
+    fn parse_array(&mut self) -> Result<Vec<Json>, String> {
+        self.bump(); // opening '['
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(']') {
+            self.bump();
+            return Ok(items);
+        }
+        loop {
+            items.push(self.parse_value()?);
+            self.skip_ws();
+            match self.bump() {
+                Some(',') => {
+                    self.skip_ws();
+                    continue;
+                }
+                Some(']') => break,
+                _ => return Err("malformed JSON record: expected ',' or ']' in array".to_string()),
+            }
+        }
+        Ok(items)
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        self.bump(); // opening quote
+        let mut out = String::new();
+        loop {
+            let c = self
+                .bump()
+                .ok_or_else(|| "malformed JSON record: unterminated string".to_string())?;
+            match c {
+                '"' => break,
+                '\\' => {
+                    let e = self
+                        .bump()
+                        .ok_or_else(|| "malformed JSON record: unterminated escape".to_string())?;
+                    match e {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        '/' => out.push('/'),
+                        'b' => out.push('\u{0008}'),
+                        'f' => out.push('\u{000c}'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'u' => {
+                            let hi = self.parse_hex4()?;
+                            let scalar = if (0xD800..=0xDBFF).contains(&hi) {
+                                if self.bump() != Some('\\') || self.bump() != Some('u') {
+                                    return Err(
+                                        "malformed JSON record: unpaired UTF-16 high surrogate"
+                                            .to_string(),
+                                    );
+                                }
+                                let lo = self.parse_hex4()?;
+                                if !(0xDC00..=0xDFFF).contains(&lo) {
+                                    return Err(
+                                        "malformed JSON record: invalid UTF-16 surrogate pair"
+                                            .to_string(),
+                                    );
+                                }
+                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                            } else if (0xDC00..=0xDFFF).contains(&hi) {
+                                return Err(
+                                    "malformed JSON record: unpaired UTF-16 low surrogate"
+                                        .to_string(),
+                                );
+                            } else {
+                                hi
+                            };
+                            out.push(
+                                char::from_u32(scalar)
+                                    .expect("surrogate arithmetic yields a valid scalar"),
+                            );
+                        }
+                        _ => {
+                            return Err(
+                                "malformed JSON record: invalid escape sequence in string"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+                c if (c as u32) < 0x20 => {
+                    return Err(
+                        "malformed JSON record: unescaped control character in string".to_string(),
+                    )
+                }
+                c => out.push(c),
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_hex4(&mut self) -> Result<u32, String> {
+        let mut value = 0u32;
+        for _ in 0..4 {
+            let c = self
+                .bump()
+                .ok_or_else(|| "malformed JSON record: truncated \\u escape".to_string())?;
+            let digit = c
+                .to_digit(16)
+                .ok_or_else(|| "malformed JSON record: invalid hexadecimal digit in \\u escape".to_string())?;
+            value = value * 16 + digit;
+        }
+        Ok(value)
+    }
+
+    fn parse_number(&mut self) -> Result<String, String> {
+        let start = self.pos;
+        if self.peek() == Some('-') {
+            self.bump();
+        }
+        match self.peek() {
+            Some('0') => {
+                self.bump();
+            }
+            Some(c) if c.is_ascii_digit() => {
+                self.bump();
+                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.bump();
+                }
+            }
+            _ => return Err("malformed JSON record: invalid number".to_string()),
+        }
+        if self.peek() == Some('.') {
+            self.bump();
+            if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return Err("malformed JSON record: fraction requires digits".to_string());
+            }
+            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                self.bump();
+            }
+        }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            self.bump();
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                self.bump();
+            }
+            if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return Err("malformed JSON record: exponent requires digits".to_string());
+            }
+            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                self.bump();
+            }
+        }
+        Ok(self.chars[start..self.pos].iter().collect())
+    }
+}
+
+/// How a grammar-valid JSON number token behaves as the unsigned integer the
+/// record schema requires.
+enum UintToken {
+    Exactly(u64),
+    /// Grammar-valid decimal integer that does not fit in `u64`.
+    TooLarge,
+    /// Negative, fractional or exponential spelling.
+    NotAnInteger,
+}
+
+fn classify_uint(token: &str) -> UintToken {
+    if !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()) {
+        match token.parse::<u64>() {
+            Ok(v) => UintToken::Exactly(v),
+            Err(_) => UintToken::TooLarge,
+        }
+    } else {
+        UintToken::NotAnInteger
+    }
+}
+
+/// Validate the parsed JSON value against the documented record schema and
+/// convert it into a [`SignedRecord`]. Messages name structural problems only;
+/// they never quote values from the input record.
+fn validate_record(value: Json) -> Result<SignedRecord, String> {
+    let entries = match value {
+        Json::Obj(entries) => entries,
+        _ => {
+            return Err(
+                "malformed record: top-level value must be a single JSON object".to_string(),
+            )
+        }
+    };
+
+    let mut format: Option<Json> = None;
+    let mut algorithm: Option<Json> = None;
+    let mut key_id: Option<Json> = None;
+    let mut key_version: Option<Json> = None;
+    let mut fields: Option<Json> = None;
+    let mut tag: Option<Json> = None;
+
+    for (name, value) in entries {
+        let slot: &mut Option<Json> = match name.as_str() {
+            "format" => &mut format,
+            "algorithm" => &mut algorithm,
+            "key_id" => &mut key_id,
+            "key_version" => &mut key_version,
+            "fields" => &mut fields,
+            "tag" => &mut tag,
+            // Reject unknown members rather than authenticating a record whose
+            // structure is not the documented one. The unexpected name is not
+            // echoed back.
+            _ => {
+                return Err(
+                    "malformed record: unexpected member; only format, algorithm, key_id, key_version, fields and tag are allowed"
+                        .to_string(),
+                )
+            }
+        };
+        // Duplicate names were already refused by the parser.
+        *slot = Some(value);
+    }
+
+    // format: integer 1. Any other integer is an explicitly *unsupported*
+    // version, not a malformed record, and must never fall through to the
+    // format-1 computation.
+    match format {
+        Some(Json::Num(token)) => match classify_uint(&token) {
+            UintToken::Exactly(v) if v == u64::from(FORMAT_VERSION) => {}
+            UintToken::Exactly(_) | UintToken::TooLarge => {
+                return Err(
+                    "unsupported format version; only format version 1 is supported".to_string(),
+                )
+            }
+            UintToken::NotAnInteger => {
+                return Err("malformed record: format must be a non-negative integer".to_string())
+            }
+        },
+        Some(_) => return Err("malformed record: format must be a non-negative integer".to_string()),
+        None => return Err("malformed record: missing required member format".to_string()),
+    }
+
+    // algorithm: exact fixed name; anything else is explicitly unsupported.
+    match algorithm {
+        Some(Json::Str(name)) if name == ALGORITHM => {}
+        Some(Json::Str(_)) => {
+            return Err(format!(
+                "unsupported algorithm; only {ALGORITHM} is supported"
+            ))
+        }
+        Some(_) => return Err("malformed record: algorithm must be a JSON string".to_string()),
+        None => return Err("malformed record: missing required member algorithm".to_string()),
+    }
+
+    // key_id: non-empty string.
+    let key_id = match key_id {
+        Some(Json::Str(s)) => s,
+        Some(_) => return Err("malformed record: key_id must be a JSON string".to_string()),
+        None => return Err("malformed record: missing required member key_id".to_string()),
+    };
+    if key_id.is_empty() {
+        return Err("malformed record: key_id must not be empty".to_string());
+    }
+
+    // key_version: integer in the same range sign accepts.
+    let key_version = match key_version {
+        Some(Json::Num(token)) => match classify_uint(&token) {
+            UintToken::Exactly(v) if (1..=u64::from(u32::MAX)).contains(&v) => v as u32,
+            _ => {
+                return Err(
+                    "malformed record: key_version must be an integer between 1 and 4294967295"
+                        .to_string(),
+                )
+            }
+        },
+        Some(_) => {
+            return Err(
+                "malformed record: key_version must be an integer between 1 and 4294967295"
+                    .to_string(),
+            )
+        }
+        None => return Err("malformed record: missing required member key_version".to_string()),
+    };
+
+    // fields: array of strings only. Order and repeats are message content.
+    let fields = match fields {
+        Some(Json::Arr(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Json::Str(s) => out.push(s),
+                    _ => {
+                        return Err(
+                            "malformed record: every field must be a JSON string".to_string(),
+                        )
+                    }
+                }
+            }
+            out
+        }
+        Some(_) => return Err("malformed record: fields must be a JSON array".to_string()),
+        None => return Err("malformed record: missing required member fields".to_string()),
+    };
+
+    // tag: exactly 32 bytes as hexadecimal; either letter case is accepted,
+    // matching how --key itself is decoded.
+    let tag = match tag {
+        Some(Json::Str(s)) => s,
+        Some(_) => return Err("malformed record: tag must be a JSON string".to_string()),
+        None => return Err("malformed record: missing required member tag".to_string()),
+    };
+    if tag.len() != 64 || !tag.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(
+            "malformed record: tag must encode exactly 32 bytes as 64 hexadecimal characters"
+                .to_string(),
+        );
+    }
+
+    Ok(SignedRecord {
+        key_id,
+        key_version,
+        fields,
+        tag,
+    })
 }
 
 fn parse_sign_args(args: &[String]) -> Result<SignOptions, String> {
