@@ -1527,3 +1527,263 @@ fn truncated_or_lone_unicode_escapes_are_corrupt_input_exit_2() {
     assert!(!stderr.contains(EXT2_KEY), "stderr echoed the key: {stderr}");
     assert!(!stderr.as_bytes().contains(&0), "stderr echoed the NUL: {stderr:?}");
 }
+
+// ---------------------------------------------------------------------------
+// verify: member names are recognized by their JSON-decoded text
+//
+// An external program that saves or re-formats a record may spell a member
+// name with \u escapes; the name is recognized by its decoded text, so the
+// rewrite stays valid. The same decoding rule makes two spellings of one
+// decoded name a duplicate member (exit 2), and never promotes a look-alike
+// name (different case, surrounding whitespace, extra characters) into a
+// known member.
+// ---------------------------------------------------------------------------
+
+/// Overwrite the spelling of one member name inside a compact signed record.
+/// `spelling` is the raw JSON text of the replacement name (without the
+/// quotes), so escape sequences can be supplied exactly as they appear on
+/// the wire.
+fn respell_member(record: &str, canonical: &str, spelling: &str) -> String {
+    let needle = format!("\"{canonical}\":");
+    assert_eq!(
+        record.matches(&needle).count(),
+        1,
+        "record must contain member {canonical} exactly once: {record}"
+    );
+    record.replacen(&needle, &format!("\"{spelling}\":"), 1)
+}
+
+#[test]
+fn verify_member_names_may_be_spelled_with_unicode_escapes() {
+    let key = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+    // Repeated field text on purpose: duplicate array items are content, not
+    // duplicate members, and must keep verifying after the rewrite.
+    let record = sign_record_bytes(key, "demo", "3", &["hello", "世界", "世界"]);
+    let body = String::from_utf8(record)
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+
+    // Each of key_id, fields and tag, one at a time, spelled with an
+    // equivalent \u escape: the decoded name is unchanged, so the record
+    // still verifies.
+    for (canonical, spelling) in [
+        ("key_id", "key_\\u0069d"),
+        ("fields", "\\u0066ields"),
+        ("tag", "ta\\u0067"),
+    ] {
+        let rewritten = respell_member(&body, canonical, spelling);
+        let out = run_verify(key, rewritten.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "respelled {canonical}: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n");
+        assert!(out.stderr.is_empty());
+    }
+
+    // All three rewrites at once, members reordered, escaped and direct
+    // spellings mixed: still the same decoded record.
+    let tag = Json::parse(&body).get("tag").as_str().to_string();
+    let reordered = format!(
+        "{{\"ta\\u0067\":\"{tag}\",\"\\u0066ields\":[\"hello\",\"世界\",\"世界\"],\"key_version\":3,\"key_\\u0069d\":\"demo\",\"algorithm\":\"HMAC-SHA256\",\"format\":1}}"
+    );
+    let out = run_verify(key, reordered.as_bytes());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_respelled_member_names_with_wrong_key_is_a_plain_mismatch() {
+    let key = "00ff";
+    let record = sign_record_bytes(key, "id", "1", &["x"]);
+    let body = String::from_utf8(record)
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+    // The legal rewrite does not change the authenticated content, so a
+    // wrong key is still an ordinary mismatch, never a structural error.
+    let rewritten = respell_member(&body, "key_id", "key_\\u0069d");
+    let out = run_verify("ff00", rewritten.as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_member_names_that_decode_to_a_duplicate_are_rejected() {
+    let key = "00ff";
+    let record = sign_record_bytes(key, "kid-secret-name", "1", &["fieldtext"]);
+    let body = String::from_utf8(record)
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+    let tag = Json::parse(&body).get("tag").as_str().to_string();
+    let zeros = "0".repeat(64);
+
+    // Each case carries two members whose names decode to the same text.
+    // Covered: value-equal and value-differing pairs, both orders, two
+    // different escape spellings of one name, and a tag pair where one copy
+    // holds the CORRECT tag. Neither the first nor the last value may be
+    // picked: every variant is structurally corrupt and must exit 2.
+    let duplicates: Vec<String> = vec![
+        // key_id: literal then escaped, same value
+        body.replacen(
+            "\"key_id\":\"kid-secret-name\"",
+            "\"key_id\":\"kid-secret-name\",\"key_\\u0069d\":\"kid-secret-name\"",
+            1,
+        ),
+        // escaped then literal, same value
+        body.replacen(
+            "\"key_id\":\"kid-secret-name\"",
+            "\"key_\\u0069d\":\"kid-secret-name\",\"key_id\":\"kid-secret-name\"",
+            1,
+        ),
+        // different values, both orders
+        body.replacen(
+            "\"key_id\":\"kid-secret-name\"",
+            "\"key_id\":\"kid-secret-name\",\"key_\\u0069d\":\"other\"",
+            1,
+        ),
+        body.replacen(
+            "\"key_id\":\"kid-secret-name\"",
+            "\"key_\\u0069d\":\"other\",\"key_id\":\"kid-secret-name\"",
+            1,
+        ),
+        // two different escape spellings of the same decoded name
+        body.replacen(
+            "\"key_id\":\"kid-secret-name\"",
+            "\"key_\\u0069d\":\"kid-secret-name\",\"key_\\u0069\\u0064\":\"kid-secret-name\"",
+            1,
+        ),
+        // fields: same value, and escaped-first with a different value
+        body.replacen(
+            "\"fields\":[\"fieldtext\"]",
+            "\"fields\":[\"fieldtext\"],\"fie\\u006cds\":[\"fieldtext\"]",
+            1,
+        ),
+        body.replacen(
+            "\"fields\":[\"fieldtext\"]",
+            "\"fie\\u006cds\":[],\"fields\":[\"fieldtext\"]",
+            1,
+        ),
+        // tag: both copies carry the CORRECT tag; still a duplicate
+        body.replacen(
+            &format!("\"tag\":\"{tag}\""),
+            &format!("\"tag\":\"{tag}\",\"ta\\u0067\":\"{tag}\""),
+            1,
+        ),
+        body.replacen(
+            &format!("\"tag\":\"{tag}\""),
+            &format!("\"ta\\u0067\":\"{tag}\",\"tag\":\"{tag}\""),
+            1,
+        ),
+        // tag: second copy different
+        body.replacen(
+            &format!("\"tag\":\"{tag}\""),
+            &format!("\"tag\":\"{tag}\",\"ta\\u0067\":\"{zeros}\""),
+            1,
+        ),
+    ];
+
+    for rec in &duplicates {
+        let out = run_verify(key, rec.as_bytes());
+        assert_eq!(out.status.code(), Some(2), "expected exit 2 for {rec}");
+        assert!(out.stdout.is_empty(), "stdout must be empty on exit 2");
+        let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+        assert!(
+            stderr.to_lowercase().contains("duplicate"),
+            "stderr must call out the duplicate member: {stderr}"
+        );
+        // The error must not echo the key, the record content, the rejected
+        // member spelling, or the tag.
+        assert!(!stderr.contains(key), "stderr echoed the key: {stderr}");
+        assert!(
+            !stderr.contains("kid-secret-name"),
+            "stderr echoed record content: {stderr}"
+        );
+        assert!(
+            !stderr.contains("fieldtext"),
+            "stderr echoed a field: {stderr}"
+        );
+        assert!(!stderr.contains(&tag), "stderr echoed the tag: {stderr}");
+        assert!(
+            !stderr.contains("0069") && !stderr.contains("0064") && !stderr.contains("0067"),
+            "stderr echoed the escaped member spelling: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn verify_lookalike_member_names_are_never_recognized() {
+    let key = "00ff";
+    let record = sign_record_bytes(key, "kid-secret-name", "1", &["fieldtext"]);
+    let body = String::from_utf8(record)
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+
+    // Names whose decoded text is not exactly a known member: escapes do not
+    // make extra members legal, and case or surrounding whitespace is never
+    // auto-corrected. Each record is otherwise complete and legal, so the
+    // unknown member is the only problem. The second element of each pair
+    // lists spellings of the rejected name that stderr must not echo.
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        // different case
+        (body.replacen("\"key_id\"", "\"Key_id\"", 1), vec!["Key_id"]),
+        // leading / trailing whitespace
+        (body.replacen("\"key_id\"", "\" key_id\"", 1), vec![" key_id"]),
+        (body.replacen("\"key_id\"", "\"key_id \"", 1), vec!["key_id "]),
+        // extra character
+        (body.replacen("\"key_id\"", "\"key_ids\"", 1), vec!["key_ids"]),
+        // escape spellings that decode to non-members
+        (
+            body.replacen("\"key_id\"", "\"key_\\u0069ds\"", 1),
+            vec!["key_ids", "0069"],
+        ),
+        (
+            body.replacen("\"fields\"", "\"FIELD\\u0053\"", 1),
+            vec!["FIELDS", "0053"],
+        ),
+        (
+            body.replacen("\"tag\"", "\"ta\\u0067x\"", 1),
+            vec!["tagx", "0067"],
+        ),
+        // an outright extra member alongside all six legal ones
+        (
+            body.replacen("{\"format\"", "{\"keyidx\":1,\"format\"", 1),
+            vec!["keyidx"],
+        ),
+    ];
+
+    for (rec, rejected_spellings) in &cases {
+        let stderr = expect_verify_invalid(rec.as_bytes(), &["--key", key]);
+        assert!(
+            stderr.contains("unexpected member"),
+            "stderr must describe the structural problem: {stderr}"
+        );
+        assert!(!stderr.contains(key), "stderr echoed the key: {stderr}");
+        assert!(
+            !stderr.contains("kid-secret-name"),
+            "stderr echoed record content: {stderr}"
+        );
+        assert!(
+            !stderr.contains("fieldtext"),
+            "stderr echoed a field: {stderr}"
+        );
+        for spelling in rejected_spellings {
+            assert!(
+                !stderr.contains(spelling),
+                "stderr echoed the rejected member name {spelling:?}: {stderr}"
+            );
+        }
+    }
+}

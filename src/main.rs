@@ -1159,4 +1159,19 @@ mod tests {
         assert!(parse_single("\"\\x\"").is_err());
         assert!(parse_single("\"\n\"").is_err()); // raw control character
     }
+
+    #[test]
+    fn member_names_compare_by_decoded_text() {
+        use json::parse_single;
+        // A \u escape spelling of a member name is the same name once
+        // decoded, so it collides with the direct spelling (and with another
+        // escape spelling) no matter which comes first or whether the values
+        // agree.
+        assert!(parse_single("{\"a\":1,\"\\u0061\":2}").is_err());
+        assert!(parse_single("{\"\\u0061\":1,\"a\":2}").is_err());
+        assert!(parse_single("{\"a\":1,\"\\u0061\":1}").is_err());
+        assert!(parse_single("{\"\\u0061\":1,\"\\u0061\":2}").is_err());
+        // Distinct decoded names stay distinct, escape spelling or not.
+        assert!(parse_single("{\"a\":1,\"\\u0062\":2}").is_ok());
+    }
 }
