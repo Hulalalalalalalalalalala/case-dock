@@ -62,11 +62,109 @@ fn decode_args() -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-struct SignOptions {
-    key: String,
-    key_id: String,
-    key_version: String,
-    fields: Vec<String>,
+/// Shared command-line option grammar for `sign` and `verify`.
+///
+/// Both subcommands accept the same two spellings for every option:
+///   --name value     (the following argument is the value, even when it
+///                    itself starts with "--")
+///   --name=value     (everything after the first '=' is the value; further
+///                    '=' characters stay part of the value)
+/// and the two forms may be mixed freely.
+///
+/// What differs between the subcommands is only *which* option names are
+/// allowed and whether a name may repeat, so each caller supplies its own
+/// option table. Values that fail are never quoted back in error messages:
+/// the messages name known options only, never the rejected text (which may
+/// be a mistyped secret).
+mod options {
+    /// How many times an option name may appear on one command line.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Multiplicity {
+        /// At most once; a second occurrence is a usage error.
+        Single,
+        /// Any number of times; values are kept in order of appearance.
+        Repeated,
+    }
+
+    /// One option accepted by a subcommand.
+    pub(super) struct Spec {
+        pub(super) name: &'static str,
+        pub(super) multiplicity: Multiplicity,
+    }
+
+    /// A matched option occurrence: the option's index in the table and its
+    /// value for this occurrence.
+    pub(super) struct Occurrence {
+        pub(super) spec_index: usize,
+        pub(super) value: String,
+    }
+
+    /// Parse `args` against `specs`, preserving order of appearance.
+    ///
+    /// Error precedence (first problem wins, left to right):
+    /// missing value for an option, repeated single-use option, unknown
+    /// option or bare argument. Callers run their own semantic validation
+    /// (hex, ranges, ...) afterwards, so grammar problems are always
+    /// reported before invalid values.
+    pub(super) fn parse(args: &[String], specs: &[Spec]) -> Result<Vec<Occurrence>, String> {
+        let mut out = Vec::new();
+        let mut seen_once = vec![false; specs.len()];
+
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            // Support both "--opt value" and "--opt=value" forms. With '='
+            // the value is everything after the FIRST '='; '=' characters
+            // inside the value are left untouched.
+            let (name, inline_value) = match arg.split_once('=') {
+                Some((n, v)) if n.starts_with("--") => (n, Some(v.to_string())),
+                _ => (arg.as_str(), None),
+            };
+            let spec_index = match specs.iter().position(|s| s.name == name) {
+                Some(idx) => idx,
+                // Never echo the unrecognized argument itself: it may be a
+                // misplaced secret (e.g. a key value whose option name was
+                // mistyped or whose value was consumed by another option).
+                None => return Err(unknown_option_error(specs)),
+            };
+            let value = match inline_value {
+                Some(v) => v,
+                None => {
+                    // The immediately following argument is the value, with
+                    // no "--"-prefix special-casing: a field or key id may
+                    // legitimately start with two dashes.
+                    i += 1;
+                    match args.get(i) {
+                        Some(v) => v.clone(),
+                        None => return Err(format!("option {name} requires a value")),
+                    }
+                }
+            };
+            if specs[spec_index].multiplicity == Multiplicity::Single && seen_once[spec_index] {
+                return Err(format!("option {name} must be given exactly once"));
+            }
+            seen_once[spec_index] = true;
+            out.push(Occurrence { spec_index, value });
+            i += 1;
+        }
+        Ok(out)
+    }
+
+    /// Build the fixed "unrecognized" message for a subcommand, listing only
+    /// that subcommand's known option names. The rejected argument is never
+    /// included.
+    fn unknown_option_error(specs: &[Spec]) -> String {
+        let names = specs
+            .iter()
+            .map(|s| s.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if specs.len() == 1 {
+            format!("unrecognized option or argument (the only known option is {names})")
+        } else {
+            format!("unrecognized option or argument (known options: {names})")
+        }
+    }
 }
 
 fn sign(args: &[String]) -> ExitCode {
@@ -102,65 +200,52 @@ fn sign(args: &[String]) -> ExitCode {
     }
 }
 
+struct SignOptions {
+    key: String,
+    key_id: String,
+    key_version: String,
+    fields: Vec<String>,
+}
+
+/// sign's option table: the three credential/metadata options are single
+/// use; only --field may repeat. Names double as their stable indices.
+const SIGN_OPTIONS: &[options::Spec] = &[
+    options::Spec {
+        name: "--key",
+        multiplicity: options::Multiplicity::Single,
+    },
+    options::Spec {
+        name: "--key-id",
+        multiplicity: options::Multiplicity::Single,
+    },
+    options::Spec {
+        name: "--key-version",
+        multiplicity: options::Multiplicity::Single,
+    },
+    options::Spec {
+        name: "--field",
+        multiplicity: options::Multiplicity::Repeated,
+    },
+];
+const SIGN_KEY_INDEX: usize = 0;
+const SIGN_KEY_ID_INDEX: usize = 1;
+const SIGN_KEY_VERSION_INDEX: usize = 2;
+
 fn parse_sign_args(args: &[String]) -> Result<SignOptions, String> {
     let mut key: Option<String> = None;
     let mut key_id: Option<String> = None;
     let mut key_version: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
 
-    let set_once = |slot: &mut Option<String>, name: &str, value: String| -> Result<(), String> {
-        if slot.is_some() {
-            return Err(format!("option {name} must be given exactly once"));
+    for occurrence in options::parse(args, SIGN_OPTIONS)? {
+        match occurrence.spec_index {
+            SIGN_KEY_INDEX => key = Some(occurrence.value),
+            SIGN_KEY_ID_INDEX => key_id = Some(occurrence.value),
+            SIGN_KEY_VERSION_INDEX => key_version = Some(occurrence.value),
+            // Field values are appended in order of appearance; repeats,
+            // empty strings and text starting with "--" are kept verbatim.
+            _ => fields.push(occurrence.value),
         }
-        *slot = Some(value);
-        Ok(())
-    };
-
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        // Support both "--opt value" and "--opt=value" forms.
-        let (name, inline_value) = match arg.split_once('=') {
-            Some((n, v)) if n.starts_with("--") => (n, Some(v.to_string())),
-            _ => (arg.as_str(), None),
-        };
-        let take_value = |i: &mut usize| -> Result<String, String> {
-            if let Some(v) = inline_value {
-                return Ok(v);
-            }
-            *i += 1;
-            args.get(*i)
-                .cloned()
-                .ok_or_else(|| format!("option {name} requires a value"))
-        };
-        match name {
-            "--key" => {
-                let v = take_value(&mut i)?;
-                set_once(&mut key, "--key", v)?;
-            }
-            "--key-id" => {
-                let v = take_value(&mut i)?;
-                set_once(&mut key_id, "--key-id", v)?;
-            }
-            "--key-version" => {
-                let v = take_value(&mut i)?;
-                set_once(&mut key_version, "--key-version", v)?;
-            }
-            "--field" => {
-                let v = take_value(&mut i)?;
-                fields.push(v);
-            }
-            _ => {
-                // Never echo the unrecognized argument itself: it may be a
-                // misplaced secret (e.g. a key value whose option name was
-                // mistyped or whose value was consumed by another option).
-                return Err(
-                    "unrecognized option or argument (known options: --key, --key-id, --key-version, --field)"
-                        .to_string(),
-                );
-            }
-        }
-        i += 1;
     }
 
     let key = key.ok_or("missing required option --key")?;
@@ -206,40 +291,23 @@ fn validate_key_hex(key: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn verify(args: &[String]) -> ExitCode {
-    // The option grammar for verify mirrors sign: "--opt value" or
-    // "--opt=value", exactly one --key, no other options. Values that fail are
-    // never echoed (they could be a mistyped secret).
-    let mut key: Option<String> = None;
-    let mut i = 0;
+    // verify deliberately shares sign's option grammar through the common
+    // parser but declares its own, narrower table: --key is the only known
+    // option, so every sign-only option (--key-id, --key-version, --field)
+    // is rejected here as unrecognized. Values that fail are never echoed
+    // (they could be a mistyped secret).
+    const VERIFY_OPTIONS: &[options::Spec] = &[options::Spec {
+        name: "--key",
+        multiplicity: options::Multiplicity::Single,
+    }];
+
     let parse = (|| -> Result<String, String> {
-        while i < args.len() {
-            let arg = &args[i];
-            let (name, inline_value) = match arg.split_once('=') {
-                Some((n, v)) if n.starts_with("--") => (n, Some(v.to_string())),
-                _ => (arg.as_str(), None),
-            };
-            if name != "--key" {
-                return Err(
-                    "unrecognized option or argument (the only known option is --key)"
-                        .to_string(),
-                );
-            }
-            let value = if let Some(v) = inline_value {
-                v
-            } else {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => v.clone(),
-                    None => return Err("option --key requires a value".to_string()),
-                }
-            };
-            if key.is_some() {
-                return Err("option --key must be given exactly once".to_string());
-            }
-            key = Some(value);
-            i += 1;
-        }
-        let key = key.ok_or("missing required option --key")?;
+        let occurrences = options::parse(args, VERIFY_OPTIONS)?;
+        // The parser enforces "at most one --key"; take it if present.
+        let key = occurrences
+            .first()
+            .map(|o| o.value.clone())
+            .ok_or("missing required option --key")?;
         validate_key_hex(&key)?;
         Ok(key)
     })();
