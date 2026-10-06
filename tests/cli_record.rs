@@ -2657,3 +2657,352 @@ fn long_keys_still_must_be_well_formed_hex() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unicode normalization regression: looking identical is not being identical.
+//
+// Format 1 authenticates each field's *raw UTF-8 text*. A precomposed
+// character and its letter + combining-mark spelling may render pixel-for
+// -pixel the same in a terminal while being different authenticated
+// messages:
+//   NFC  = U+00E9                    ("é", 1 code point, 2 UTF-8 bytes)
+//   NFD  = U+0065 + U+0301           ("e" + combining acute, 2 code points,
+//                                     3 UTF-8 bytes)
+// The tool must never "helpfully" replace one spelling with the other to make
+// them display consistently. Both are legal text, each signs and verifies
+// under its own tag.
+//
+// The source below builds every such text from ASCII `\u{..}` escapes on
+// purpose: a pasted literal would be visually indistinguishable here too.
+// Golden tags are independent Python HMAC-SHA256 values over the README
+// format-1 contract (and were additionally cross-checked against the binary),
+// never derived from this crate's own HMAC code.
+// ---------------------------------------------------------------------------
+
+/// Precomposed e-acute: one code point U+00E9 (UTF-8 c3 a9).
+const NFC_EACUTE: &str = "\u{00e9}";
+/// Decomposed look-alike: 'e' (U+0065) then combining acute (U+0301)
+/// (UTF-8 65 cc 81). It usually renders exactly like `NFC_EACUTE`.
+const NFD_EACUTE: &str = "\u{0065}\u{0301}";
+/// The combining acute accent standing alone (U+0301, UTF-8 cc 81).
+const COMBINING_ACUTE: &str = "\u{0301}";
+
+const UNI_KEY: &str = "00ff";
+const UNI_KEY_ID: &str = "id";
+const UNI_VERSION: &str = "1";
+
+// Independent Python goldens over (key 00ff, key_id "id", version 1).
+const TAG_NFC: &str = "0a0d1264786153d4cee915619413d30a55e0886069d13a4aaccb0290bd20b8de";
+const TAG_NFD: &str = "d7698cf682d11e71b08655ebab11056fbec33480f6665daa2104156866663f01";
+const TAG_MARK_ONLY: &str = "02fea2ee40a762e86d37a466529969f7a1d3f16912e24dd7612c200960352113";
+const TAG_E_THEN_MARK: &str = "c9dc1f7e48b108b2f0f46f8151da4ea44c5f98bf2967be089cb5a31f739726a3";
+const TAG_NFC_NFD_NFC: &str = "b645b9145638eab0d912c471bc6522f1ddae765b0421078c7f8a21ae58b0739f";
+const TAG_NFD_NFC_NFD: &str = "26270edcd121de31632d60e738d23563b2534ec2b1180e81bce9ad0e5d69ea65";
+
+/// A second, independent producer with its own key/key-id/version; its records
+/// are hand-authored below and never produced by `sign`, so a shared
+/// sign/verify bug cannot validate them.
+const EXTUNI_KEY: &str = "ab12cd34ef56ab78cd90ef12a3b4c5d6";
+const EXTUNI_KEY_ID: &str = "ext-uni";
+const EXTUNI_VERSION: u32 = 9;
+const EXTUNI_TAG_NFC: &str = "c528bac32e7cf930aae0af789393b6aae07a730eb08b0ba51ee1763fc4aa0f23";
+const EXTUNI_TAG_NFD: &str = "4bcab695c7916a887c309b3bdc7aa099f8478e4b54b756bbf25fd34e9587d510";
+const EXTUNI_TAG_NFC_NFD_NFC: &str =
+    "3284a627d5576a1893cfd00bbfab669187379c81b6f80fdc2ca9c2a27952b2de";
+const EXTUNI_TAG_MARK_ONLY: &str =
+    "19d983b786859cbb02739c2e9d9324df61f7b46beca7302e542dce385967fe4f";
+const EXTUNI_TAG_E_THEN_MARK: &str =
+    "c46f9f78c1df59458b42fec75dee2f962ac97076f7d1074a9cd89ba84bf8699e";
+
+/// Build one compact format-1 record with a raw `fields` array body supplied
+/// as exact JSON text (so escape spellings can be controlled per test).
+fn compact_record(key_id: &str, version: u32, fields_body: &str, tag: &str) -> String {
+    format!(
+        r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"{key_id}","key_version":{version},"fields":[{fields_body}],"tag":"{tag}"}}"#
+    )
+}
+
+#[test]
+fn nfc_and_nfd_lookalikes_sign_as_distinct_messages() {
+    // Same key, key id, version and field count: only the raw text differs.
+    // Both must sign successfully (exit 0, empty stderr, one JSON line) and
+    // keep their input character for character; the tags must differ.
+    let nfc = expect_signed_record(
+        "nfc-eacute",
+        UNI_KEY,
+        UNI_KEY_ID,
+        UNI_VERSION,
+        &[NFC_EACUTE],
+        TAG_NFC,
+    );
+    let nfd = expect_signed_record(
+        "nfd-eacute",
+        UNI_KEY,
+        UNI_KEY_ID,
+        UNI_VERSION,
+        &[NFD_EACUTE],
+        TAG_NFD,
+    );
+
+    // The decoded record fields are preserved exactly, not normalized toward
+    // the visually identical other spelling.
+    assert_eq!(nfc.fields, vec![NFC_EACUTE.to_string()]);
+    assert_eq!(nfd.fields, vec![NFD_EACUTE.to_string()]);
+    assert_ne!(nfc.fields, nfd.fields);
+    assert_ne!(nfc.tag, nfd.tag, "identical rendering must not mean one tag");
+
+    // Pin the raw-text difference the authentication sees.
+    assert_ne!(NFC_EACUTE, NFD_EACUTE);
+    assert_eq!(NFC_EACUTE.chars().count(), 1);
+    assert_eq!(NFC_EACUTE.len(), 2);
+    assert_eq!(NFD_EACUTE.chars().count(), 2);
+    assert_eq!(NFD_EACUTE.len(), 3);
+
+    // The wire record keeps the raw UTF-8 for each spelling rather than
+    // emitting an escape or the other form.
+    let nfc_raw = String::from_utf8(run_sign(UNI_KEY, UNI_KEY_ID, UNI_VERSION, &[NFC_EACUTE]).stdout).unwrap();
+    assert!(nfc_raw.contains(NFC_EACUTE), "NFC form must stay raw UTF-8: {nfc_raw}");
+    assert!(!nfc_raw.contains(NFD_EACUTE), "must not be rewritten to the combining form");
+    let nfd_raw = String::from_utf8(run_sign(UNI_KEY, UNI_KEY_ID, UNI_VERSION, &[NFD_EACUTE]).stdout).unwrap();
+    assert!(nfd_raw.contains(NFD_EACUTE), "combining sequence must stay raw and joined: {nfd_raw}");
+    assert!(!nfd_raw.contains(NFC_EACUTE), "must not be rewritten to the precomposed form");
+}
+
+#[test]
+fn mixed_and_repeated_lookalike_fields_keep_order_and_each_occurrence() {
+    // A record containing BOTH spellings, one of them repeated: order and
+    // every occurrence survive, with no merging or rewriting of combining
+    // marks. Both orderings are pinned with their own independent golden.
+    let aba = expect_signed_record(
+        "nfc-nfd-nfc",
+        UNI_KEY,
+        UNI_KEY_ID,
+        UNI_VERSION,
+        &[NFC_EACUTE, NFD_EACUTE, NFC_EACUTE],
+        TAG_NFC_NFD_NFC,
+    );
+    let bab = expect_signed_record(
+        "nfd-nfc-nfd",
+        UNI_KEY,
+        UNI_KEY_ID,
+        UNI_VERSION,
+        &[NFD_EACUTE, NFC_EACUTE, NFD_EACUTE],
+        TAG_NFD_NFC_NFD,
+    );
+
+    assert_eq!(
+        aba.fields,
+        vec![
+            NFC_EACUTE.to_string(),
+            NFD_EACUTE.to_string(),
+            NFC_EACUTE.to_string(),
+        ]
+    );
+    assert_eq!(
+        bab.fields,
+        vec![
+            NFD_EACUTE.to_string(),
+            NFC_EACUTE.to_string(),
+            NFD_EACUTE.to_string(),
+        ]
+    );
+    // Three entries, with the repeated form kept twice (not deduplicated).
+    assert_eq!(aba.fields.len(), 3);
+    assert_eq!(bab.fields.len(), 3);
+    assert_ne!(aba.tag, bab.tag, "field order is authenticated");
+}
+
+#[test]
+fn verify_treats_json_spelling_not_message_changes_as_still_valid() {
+    // Verify authenticates the DECODED character sequence. Re-spelling a field
+    // on the wire as \u escapes changes the JSON bytes but not the message, so
+    // the original tag stays valid: {"valid":true}, exit 0, empty stderr.
+
+    // NFC field: direct raw UTF-8 vs "\u00e9".
+    let nfc_body = String::from_utf8(sign_record_bytes(
+        UNI_KEY,
+        UNI_KEY_ID,
+        UNI_VERSION,
+        &[NFC_EACUTE],
+    ))
+    .unwrap();
+    let nfc_body = nfc_body.trim_end_matches('\n');
+    let nfc_as_escape = nfc_body.replace(NFC_EACUTE, "\\u00e9");
+    assert_ne!(nfc_as_escape, nfc_body, "test must actually change the wire spelling");
+    for input in [nfc_body.to_string(), nfc_as_escape] {
+        let out = run_verify(UNI_KEY, input.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n");
+        assert!(out.stderr.is_empty());
+    }
+
+    // NFD field: the combining mark spelled three equivalent ways:
+    //   direct "e" + raw U+0301,  "e\u0301",  "\u0065\u0301".
+    let nfd_body = String::from_utf8(sign_record_bytes(
+        UNI_KEY,
+        UNI_KEY_ID,
+        UNI_VERSION,
+        &[NFD_EACUTE],
+    ))
+    .unwrap();
+    let nfd_body = nfd_body.trim_end_matches('\n').to_string();
+    let nfd_mark_escaped = nfd_body.replace(NFD_EACUTE, "e\\u0301");
+    let nfd_all_escaped = nfd_body.replace(NFD_EACUTE, "\\u0065\\u0301");
+    assert!(nfd_mark_escaped.contains("e\\u0301"));
+    assert!(nfd_all_escaped.contains("\\u0065\\u0301"));
+    for input in [nfd_body, nfd_mark_escaped, nfd_all_escaped] {
+        let out = run_verify(UNI_KEY, input.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n");
+        assert!(out.stderr.is_empty());
+    }
+}
+
+#[test]
+fn external_nfc_nfd_records_follow_the_published_contract() {
+    // Records hand-authored as if emitted by an external program that only
+    // knows the README format-1 recipe; `sign` never produces these. Direct
+    // and \u-escape spellings of the same decoded text share one golden tag.
+
+    // NFC message: raw UTF-8 spelling and pure-escape spelling.
+    let nfc_direct = compact_record(
+        EXTUNI_KEY_ID,
+        EXTUNI_VERSION,
+        &format!("\"{NFC_EACUTE}\""),
+        EXTUNI_TAG_NFC,
+    );
+    let nfc_escaped = compact_record(
+        EXTUNI_KEY_ID,
+        EXTUNI_VERSION,
+        r#""\u00e9""#,
+        EXTUNI_TAG_NFC,
+    );
+    expect_external_valid(nfc_direct.as_bytes(), EXTUNI_KEY);
+    expect_external_valid(nfc_escaped.as_bytes(), EXTUNI_KEY);
+
+    // NFD message: direct combining mark, short e+\u0301, and fully escaped.
+    let nfd_direct = compact_record(
+        EXTUNI_KEY_ID,
+        EXTUNI_VERSION,
+        &format!("\"{NFD_EACUTE}\""),
+        EXTUNI_TAG_NFD,
+    );
+    let nfd_short_escape =
+        compact_record(EXTUNI_KEY_ID, EXTUNI_VERSION, r#""e\u0301""#, EXTUNI_TAG_NFD);
+    let nfd_full_escape = compact_record(
+        EXTUNI_KEY_ID,
+        EXTUNI_VERSION,
+        r#""\u0065\u0301""#,
+        EXTUNI_TAG_NFD,
+    );
+    expect_external_valid(nfd_direct.as_bytes(), EXTUNI_KEY);
+    expect_external_valid(nfd_short_escape.as_bytes(), EXTUNI_KEY);
+    expect_external_valid(nfd_full_escape.as_bytes(), EXTUNI_KEY);
+
+    // Both spellings in one record (the first repeated), with mixed wire
+    // spellings: NFC raw, NFD escaped, NFC escaped.
+    let mixed = compact_record(
+        EXTUNI_KEY_ID,
+        EXTUNI_VERSION,
+        &format!("\"{NFC_EACUTE}\",\"e\\u0301\",\"\\u00e9\""),
+        EXTUNI_TAG_NFC_NFD_NFC,
+    );
+    expect_external_valid(mixed.as_bytes(), EXTUNI_KEY);
+
+    // The positive cases are not vacuous: the same record under a wrong key is
+    // an ordinary mismatch, not a structural rejection.
+    expect_external_mismatch(nfc_escaped.as_bytes(), "ab12cd34ef56ab78cd90ef12a3b4c5d7");
+}
+
+#[test]
+fn swapping_precomposed_for_combining_is_a_mismatch_both_directions() {
+    // Only the field text is substituted between the two look-alikes; the tag
+    // and everything else stay as in the original record. Each record is still
+    // legal JSON and a structurally valid format-1 record, so the result must
+    // be {"valid":false}, exit 1, empty stderr -- never valid and never exit 2.
+    // Both substitution directions and both JSON spellings are covered.
+
+    // Record decodes to NFD but carries the tag signed over NFC.
+    let nfd_direct_with_nfc_tag =
+        compact_record(UNI_KEY_ID, 1, &format!("\"{NFD_EACUTE}\""), TAG_NFC);
+    let nfd_escaped_with_nfc_tag =
+        compact_record(UNI_KEY_ID, 1, r#""e\u0301""#, TAG_NFC);
+    expect_external_mismatch(nfd_direct_with_nfc_tag.as_bytes(), UNI_KEY);
+    expect_external_mismatch(nfd_escaped_with_nfc_tag.as_bytes(), UNI_KEY);
+
+    // Record decodes to NFC but carries the tag signed over NFD.
+    let nfc_direct_with_nfd_tag =
+        compact_record(UNI_KEY_ID, 1, &format!("\"{NFC_EACUTE}\""), TAG_NFD);
+    let nfc_escaped_with_nfd_tag =
+        compact_record(UNI_KEY_ID, 1, r#""\u00e9""#, TAG_NFD);
+    expect_external_mismatch(nfc_direct_with_nfd_tag.as_bytes(), UNI_KEY);
+    expect_external_mismatch(nfc_escaped_with_nfd_tag.as_bytes(), UNI_KEY);
+}
+
+#[test]
+fn lone_combining_mark_and_split_fields_are_distinct_legal_messages() {
+    // A combining accent with no preceding letter is a perfectly legal field;
+    // it must not be mistaken for corrupt input.
+    let mark_only = expect_signed_record(
+        "mark-only",
+        UNI_KEY,
+        UNI_KEY_ID,
+        UNI_VERSION,
+        &[COMBINING_ACUTE],
+        TAG_MARK_ONLY,
+    );
+    assert_eq!(mark_only.fields, vec![COMBINING_ACUTE.to_string()]);
+    assert_eq!(mark_only.fields[0].chars().count(), 1);
+    assert_eq!(mark_only.fields[0].len(), 2);
+
+    // Splitting the letter and the accent into TWO fields is yet another
+    // message and must not share the one-field combining spelling's tag.
+    let split = expect_signed_record(
+        "e-then-mark",
+        UNI_KEY,
+        UNI_KEY_ID,
+        UNI_VERSION,
+        &["e", COMBINING_ACUTE],
+        TAG_E_THEN_MARK,
+    );
+    assert_eq!(split.fields, vec!["e".to_string(), COMBINING_ACUTE.to_string()]);
+    assert_ne!(split.tag, TAG_NFD, "two fields must not carry the one-field tag");
+    assert_ne!(split.tag, mark_only.tag);
+
+    // Cross-tagging the one-field and two-field forms is a silent mismatch
+    // (exit 1), in both directions, even though the concatenated visible text
+    // ("e" followed by the accent) looks like one combining spelling.
+    let split_fields_nfd_tag =
+        compact_record(UNI_KEY_ID, 1, r#""e","\u0301""#, TAG_NFD);
+    let one_field_split_tag = compact_record(
+        UNI_KEY_ID,
+        1,
+        &format!("\"{NFD_EACUTE}\""),
+        TAG_E_THEN_MARK,
+    );
+    expect_external_mismatch(split_fields_nfd_tag.as_bytes(), UNI_KEY);
+    expect_external_mismatch(one_field_split_tag.as_bytes(), UNI_KEY);
+
+    // An external producer's lone-mark and split records verify per the
+    // published rules: the lone mark works as a "\u0301" escape too.
+    let ext_mark =
+        compact_record(EXTUNI_KEY_ID, EXTUNI_VERSION, r#""\u0301""#, EXTUNI_TAG_MARK_ONLY);
+    let ext_split = compact_record(
+        EXTUNI_KEY_ID,
+        EXTUNI_VERSION,
+        r#""e","\u0301""#,
+        EXTUNI_TAG_E_THEN_MARK,
+    );
+    expect_external_valid(ext_mark.as_bytes(), EXTUNI_KEY);
+    expect_external_valid(ext_split.as_bytes(), EXTUNI_KEY);
+}
