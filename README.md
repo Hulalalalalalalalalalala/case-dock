@@ -15,6 +15,40 @@ cargo build --offline
 authnote 0.1.0
 ```
 
+## 选项写法：空格分隔与等号
+
+`sign` 和 `verify` 的每个选项都接受两种写法，并可在同一次调用中随意
+混用：
+
+- `--名称 值`：紧随选项的**整个**下一个参数就是值；
+- `--名称=值`：第一个 `=` 之后的全部内容就是值。
+
+两种写法只是拼写不同，相同的实际输入必然得到相同的结果（同一条输出
+记录、同一个验证结论）。值的边界按写法确定：
+
+- 等号形式只在**第一个** `=` 处分开选项名和值，后续的 `=` 属于值本身：
+  `--field=a=b=c` 的字段值是 `a=b=c`。
+- 空格形式不做任何选项样式判断：紧随选项的参数即使字面恰好是 `--key`
+  或 `--field`，也整个作为值，不会被当成下一项选项。因此传入以 `--`
+  开头的字段无需任何转义：
+
+  ```sh
+  ./target/debug/authnote sign --key 0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b \
+      --key-id demo --key-version 3 --field --key
+  ```
+
+  ```json
+  {"format":1,"algorithm":"HMAC-SHA256","key_id":"demo","key_version":3,"fields":["--key"],"tag":"092276080917f61cd49a9aadd841bc72a9221764386e869a46a5a70e0b1b73d4"}
+  ```
+
+  这里的 `--key` 是合法的字段文本。要与之区分的是缺值错误：命令末尾
+  只有 `--field`、没有下一个参数时，报 `option --field requires a value`，
+  以状态码 2 结束，标准输出为空。
+- `--field=` 表示一个空字段（等号后没有任何字符，值就是空文本），与
+  空格形式的 `--field ""` 等价；只有完全不传 `--field` 才表示零个字段。
+  二者输出的 `fields` 数组（`[""]` 与 `[]`）和被认证的内容都不同，
+  具体输出见下面 sign 一节。
+
 ## sign：生成认证标签
 
 ```sh
@@ -46,6 +80,40 @@ authnote sign --key HEX --key-id ID --key-version N [--field TEXT]...
 记录含格式版本（`format`，恒为 1）、算法名称、密钥标识、密钥版本号、原始字段
 数组和小写十六进制标签；不包含原始密钥。
 
+空格与等号两种写法可以在一次调用中混用；重复的 `--field` 无论用哪种写法都
+按出现次序追加，不会因为换了写法而合并或重排：
+
+```sh
+./target/debug/authnote sign --key 0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b \
+    --key-id=demo --key-version 3 \
+    --field 世界 --field=a=b=c --field 重复 --field=重复
+```
+
+```json
+{"format":1,"algorithm":"HMAC-SHA256","key_id":"demo","key_version":3,"fields":["世界","a=b=c","重复","重复"],"tag":"4bb624f9709a4c98452f091800bf67ab761495d607e7b9104164a8fffc95c220"}
+```
+
+输出记录中 `fields` 依次为 `世界`、`a=b=c`（等号形式的值，内部的两个 `=`
+原样保留）、`重复`、`重复`（重复字段保留两次），与参数出现顺序一致。把每个
+选项换成另一种写法（如 `--key=...`、`--field 世界`）得到的是同一条记录。
+
+零个字段与一个空字段是两种不同的认证内容，输出也不同：
+
+```sh
+./target/debug/authnote sign --key 0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b \
+    --key-id demo --key-version 3
+# {"format":1,...,"fields":[],"tag":"e1ac8accdf8b6e00d70f75f7b991a004281caf5460c1fec9960e21ec670c1b66"}
+
+./target/debug/authnote sign --key 0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b \
+    --key-id demo --key-version 3 --field=
+# {"format":1,...,"fields":[""],"tag":"d4c5a517df5826028883128e5185894d4f55e72f7be5d65f3e96ffdf29382831"}
+```
+
+等号写法沿用同样的校验要求：`--key`、`--key-id`、`--key-version` 仍各只能
+出现一次，跨两种写法重复（如 `--key K1 --key=K2`）同样被拒绝。`--key=` 或
+`--key-id=` 表示选项已提供但值为空，属于值不合法（分别报密钥须为非空偶数位
+十六进制、密钥标识不能为空），而不是"缺少该选项"。
+
 参数不合法（值非法、必需参数缺失或重复、选项缺少值、无法识别的参数）时以状态码 2
 结束，标准错误说明具体原因，标准输出为空。在允许传入非 UTF-8 参数的系统上，
 某个参数无法解码为 UTF-8 文本时同样以状态码 2 结束，标准错误只说明该参数不是
@@ -62,6 +130,21 @@ authnote verify --key HEX < record.json
 密钥（格式要求与 `sign --key` 完全相同）。程序使用记录内的原始字段、密钥标识
 和密钥版本号，按下面的 format 1 编码与 HMAC-SHA256 规则复算标签并与记录中的
 标签比较。
+
+`--key` 同样可以写成等号形式。例如把上面混合写法示例生成的记录存入
+`record.json` 后：
+
+```sh
+./target/debug/authnote verify --key=0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b < record.json
+```
+
+```json
+{"valid":true}
+```
+
+与空格写法 `--key 0b0b...` 的验证结果完全相同（状态码 0）。`verify` 只接受
+`--key` 这一个选项（两种写法均可，但只能出现一次）；`--key-id`、`--key-version`
+和 `--field` 在 `verify` 中一律属于无法识别的参数，以状态码 2 结束。
 
 - 标准输入必须恰好包含**一条**完整的 JSON 对象：允许前后 JSON 空白
   （空格、制表符、换行、回车），记录可以重新排版，成员顺序也不影响结果；
