@@ -2462,3 +2462,222 @@ fn verify_lookalike_member_names_are_never_recognized() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Long keys: HMAC-SHA256 accepts keys of any length. A key longer than one
+// SHA-256 block (64 bytes) is a completely ordinary key - it must not be
+// rejected, truncated to the first 64 bytes, or hashed prematurely. Every
+// golden tag below was computed independently with Python's
+// hmac/hashlib/struct from the format-1 recipe in README.md, so a change that
+// silently truncated the key (a common shortcut some implementations take)
+// would fail these tests on both sign and verify.
+//
+// The authenticated content is fixed throughout this section:
+//   key-id "regress-long", version 9, fields ["alpha", "世界"]
+// and keys are named by their decoded BYTE length (128 hex chars = 64 bytes).
+// ---------------------------------------------------------------------------
+
+const LONG_KEY_ID: &str = "regress-long";
+const LONG_KEY_VERSION: &str = "9";
+const LONG_FIELDS: &[&str] = &["alpha", "世界"];
+
+/// Hexadecimal text of the key `00 01 02 ... n-1`: every key in this section
+/// starts with an ordinary `00` byte and spans several lengths, so the `00`
+/// being authenticated like any other byte is covered by the golden tags.
+fn ascending_key_hex(byte_len: usize) -> String {
+    assert!(byte_len <= 256);
+    (0..byte_len as u8).map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn sign_long_keys_match_independent_standard_hmac_goldens() {
+    // 63 and 65 bytes straddle the 64-byte SHA-256 block boundary on either
+    // side; 64 bytes is exactly one block; 128 bytes is plainly beyond it.
+    let cases: &[(usize, &str)] = &[
+        (63, "ba36b46fd9e6304cd537e85cd9e5a2c05accea44d5f1e56993fee1058a2e5c21"),
+        (64, "4ba2c49f0f0c464beee63906b408c91fbe36ede899729bd5cdfda4be7bf37851"),
+        (65, "c0b517ea385dac5e065ccf0dd6bb8e2cee610e359486d564d105de8f6c2fb67d"),
+        (128, "2945b05715458edc04646ebe8683a848ea2fd72845016e5163324bfacf1df2fe"),
+    ];
+    let mut seen_tags = std::collections::HashSet::new();
+    for (byte_len, golden) in cases {
+        let key = ascending_key_hex(*byte_len);
+        assert_eq!(key.len(), byte_len * 2, "hex length sanity for {byte_len}");
+        let rec = expect_signed_record(
+            &format!("key-{byte_len}-bytes"),
+            &key,
+            LONG_KEY_ID,
+            LONG_KEY_VERSION,
+            LONG_FIELDS,
+            golden,
+        );
+        assert!(
+            seen_tags.insert(rec.tag.clone()),
+            "keys of different lengths must authenticate differently: {golden}"
+        );
+    }
+}
+
+#[test]
+fn long_key_hex_case_does_not_change_the_decoded_key() {
+    // The same 63-byte key written in mixed / upper case must reproduce the
+    // exact independent golden; hexadecimal letter case is not key material.
+    let lower = ascending_key_hex(63);
+    let golden = "ba36b46fd9e6304cd537e85cd9e5a2c05accea44d5f1e56993fee1058a2e5c21";
+    for key in [lower.to_uppercase(), lower.replace('a', "A").replace('f', "F")] {
+        expect_signed_record(
+            "long-key-case",
+            &key,
+            LONG_KEY_ID,
+            LONG_KEY_VERSION,
+            LONG_FIELDS,
+            golden,
+        );
+    }
+}
+
+#[test]
+fn long_key_records_round_trip_through_verify() {
+    for byte_len in [63usize, 64, 65, 128] {
+        let key = ascending_key_hex(byte_len);
+        let record = sign_record_bytes(&key, LONG_KEY_ID, LONG_KEY_VERSION, LONG_FIELDS);
+        // exit 0, exact stdout, empty stderr - the same contract as for a
+        // short key.
+        expect_external_valid(&record, &key);
+    }
+
+    // Short keys stay exactly as compatible as before; this section must not
+    // have shifted the behavior for the existing sample key lengths.
+    let short = sign_record_bytes("00ff", "id", "1", &["x"]);
+    expect_external_valid(&short, "00ff");
+}
+
+#[test]
+fn verify_uses_the_whole_long_key_not_just_the_first_block() {
+    // A record signed with a 65-byte key: altering ONLY byte 65 (past the
+    // 64-byte block) or handing over the first 64 bytes as a legal key must
+    // each be an authentication mismatch (exit 1, empty stderr) - never valid
+    // and never "corrupt record" (exit 2).
+    let k65 = ascending_key_hex(65);
+    let k64 = ascending_key_hex(64);
+    let k65_tail_changed = format!("{}41", ascending_key_hex(64)); // byte 65: 0x40 -> 0x41
+    assert_ne!(k65, k65_tail_changed);
+    let rec65 = sign_record_bytes(&k65, LONG_KEY_ID, LONG_KEY_VERSION, LONG_FIELDS);
+    expect_external_mismatch(&rec65, &k65_tail_changed);
+    expect_external_mismatch(&rec65, &k64);
+    // Sanity: the record is intact and valid under its full real key.
+    expect_external_valid(&rec65, &k65);
+
+    // Same guarantee for a 128-byte key: tampering only with bytes past 64
+    // (here zeroing the second half, or changing just the final byte) and
+    // truncation to 64 bytes must both be plain mismatches.
+    let k128 = ascending_key_hex(128);
+    let k128_tail_zeroed = format!("{}{}", ascending_key_hex(64), "00".repeat(64));
+    let k128_last_changed = format!("{}5a", ascending_key_hex(127)); // final 0x7f -> 0x5a
+    let rec128 = sign_record_bytes(&k128, LONG_KEY_ID, LONG_KEY_VERSION, LONG_FIELDS);
+    expect_external_mismatch(&rec128, &k128_tail_zeroed);
+    expect_external_mismatch(&rec128, &k128_last_changed);
+    expect_external_mismatch(&rec128, &k128[..128]); // first 64 bytes as hex text
+    expect_external_valid(&rec128, &k128);
+}
+
+#[test]
+fn external_records_signed_with_long_keys_verify_and_mismatch_like_short_ones() {
+    // Records hand-authored as if produced by another program, with tags
+    // computed independently in Python over the published format-1 contract.
+    // `sign` is never used to produce these, and both keys exceed one
+    // SHA-256 block: a 96-byte patterned key and a 65-byte boundary key.
+
+    // 96-byte key, content including a real newline (JSON short escape).
+    const EXTLONG_KEY: &str =
+        "0b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186\
+         abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc0126\
+         4b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6";
+    const EXTLONG_TAG: &str =
+        "42634a2539afa582a48020dad2fa18eb79b699d0bf11879132b4a156f66c3d66";
+    // Same first 64 bytes; every byte past byte 64 is flipped.
+    const EXTLONG_KEY_TAIL_FLIPPED: &str =
+        "0b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186\
+         abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc0126\
+         b48f6a4520fbd6b18c67421df8d3ae89643f1af5d0ab86613c17f2cda8835e39";
+    let record96 = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"external-长密钥","key_version":2026,"fields":["line1\nline2","x"],"tag":"@@TAG@@"}"#,
+        EXTLONG_TAG,
+    );
+    expect_external_valid(record96.as_bytes(), EXTLONG_KEY);
+    expect_external_mismatch(record96.as_bytes(), EXTLONG_KEY_TAIL_FLIPPED);
+    expect_external_mismatch(record96.as_bytes(), &EXTLONG_KEY[..128]);
+
+    // 65-byte key (64 equal bytes plus one distinct trailing byte) and a
+    // different message with one Chinese field followed by an empty field.
+    const EXT65_KEY: &str =
+        "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
+         2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2aa5";
+    const EXT65_KEY_LAST_FLIPPED: &str =
+        "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
+         2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2aa6";
+    const EXT65_TAG: &str =
+        "11bfcbe2b3e344593c5d812c0827e591c5a6706dcdc9c0be782bfe916b156dc3";
+    let record65 = with_tag(
+        r#"{"format":1,"algorithm":"HMAC-SHA256","key_id":"ext-boundary","key_version":1,"fields":["边界",""],"tag":"@@TAG@@"}"#,
+        EXT65_TAG,
+    );
+    expect_external_valid(record65.as_bytes(), EXT65_KEY);
+    expect_external_mismatch(record65.as_bytes(), EXT65_KEY_LAST_FLIPPED);
+    expect_external_mismatch(record65.as_bytes(), &EXT65_KEY[..128]);
+}
+
+#[test]
+fn long_keys_still_require_nonempty_even_hexadecimal_text() {
+    // Length alone never relaxes the key grammar: an odd digit count or a
+    // single non-hex character in a long key is still a usage error
+    // (exit 2, empty stdout, stderr names the key problem, never the key).
+
+    let k65 = ascending_key_hex(65);
+    let k128 = ascending_key_hex(128);
+
+    // Odd-length long keys (one digit dropped / one extra digit).
+    let odd_cases = [format!("{k65}a"), k128[..129].to_string(), k65[..k65.len() - 1].to_string()];
+    for bad in &odd_cases {
+        assert_eq!(bad.len() % 2, 1, "case setup: {bad:?} must be odd-length");
+        let stderr = expect_usage_error(&[
+            "--key", bad, "--key-id", LONG_KEY_ID, "--key-version", LONG_KEY_VERSION,
+        ]);
+        assert!(stderr.contains("--key"), "stderr must name the option: {stderr}");
+        assert!(
+            stderr.to_lowercase().contains("hex"),
+            "stderr must describe the key format problem: {stderr}"
+        );
+        assert!(!stderr.contains(bad), "stderr must not echo the key: {stderr}");
+    }
+
+    // Non-hex characters, both at the end and buried inside a long key.
+    let mut buried = k128.clone();
+    buried.replace_range(40..42, "zz"); // well inside the first block region
+    let nonhex_cases = [format!("{k65}zz"), buried];
+    for bad in &nonhex_cases {
+        assert_eq!(bad.len() % 2, 0, "case setup: {bad:?} must stay even-length");
+        let stderr = expect_usage_error(&[
+            "--key", bad, "--key-id", LONG_KEY_ID, "--key-version", LONG_KEY_VERSION,
+        ]);
+        assert!(stderr.contains("--key"), "stderr must name the option: {stderr}");
+        assert!(
+            stderr.to_lowercase().contains("hex"),
+            "stderr must describe the key format problem: {stderr}"
+        );
+        assert!(!stderr.contains(bad), "stderr must not echo the key: {stderr}");
+    }
+
+    // verify inherits the exact same checks, including for long keys. Feed an
+    // otherwise valid record; key validation fails first, so stdin is moot.
+    let some_record = sign_record_bytes("00ff", "id", "1", &["x"]);
+    for bad in [format!("{k65}a"), format!("{k128}zz")] {
+        let stderr = expect_verify_invalid(&some_record, &["--key", &bad]);
+        assert!(stderr.contains("--key"), "stderr must name the option: {stderr}");
+        assert!(
+            stderr.to_lowercase().contains("hex"),
+            "stderr must describe the key format problem: {stderr}"
+        );
+        assert!(!stderr.contains(&bad), "stderr must not echo the key: {stderr}");
+    }
+}
