@@ -253,6 +253,218 @@ fn verify_wrong_key_and_tampered_fields_exit_1() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// verify: key_version regression coverage
+//
+// key_version plays two roles at once: it is part of the authenticated content
+// (changing it must invalidate the tag) and it is constrained by the record
+// grammar (a strict JSON integer in 1..=4294967295). Callers must be able to
+// tell "the version changed, so the tag no longer matches" (exit 1) apart from
+// "the version spelling in the record is illegal" (exit 2).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verify_key_version_range_endpoints_are_normal_versions() {
+    let key = "00ff";
+    let wrong_key = "ff00";
+
+    // Both endpoints of 1..=4294967295 must work as ordinary versions on a
+    // format-1 record: exit 0, one {"valid":true} line, empty stderr.
+    for version in ["1", "4294967295"] {
+        let record = sign_record_bytes(key, "id", version, &["x"]);
+        let out = run_verify(key, &record);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "version {version}: expected valid, stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n");
+        assert!(out.stderr.is_empty());
+
+        // The same structurally legal record under the wrong key is a
+        // mismatch: the key choice never turns a legal version into bad input.
+        let out = run_verify(wrong_key, &record);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(out.stdout, b"{\"valid\":false}\n");
+        assert!(out.stderr.is_empty());
+    }
+
+    // The key version is independent of the record's format version: a
+    // format-1 record carrying key version 7 must not be rejected as an
+    // unsupported format.
+    let v7 = sign_record_bytes(key, "id", "7", &["x"]);
+    let out = run_verify(key, &v7);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_changed_key_version_is_a_mismatch_not_corrupt_input() {
+    let key = "00ff";
+    let wrong_key = "ff00";
+    // Everything but the version number stays byte-identical, tag included:
+    // the record is still legal JSON, only the authenticated content moved.
+    let body = String::from_utf8(sign_record_bytes(key, "id", "7", &["vfield"])).unwrap();
+    let moved = body.replacen("\"key_version\":7", "\"key_version\":8", 1);
+    // Sanity check: exactly the version token moved, nothing else.
+    assert!(moved.contains("\"key_version\":8"));
+    assert!(!moved.contains("\"key_version\":7"));
+
+    for used_key in [key, wrong_key] {
+        let out = run_verify(used_key, moved.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "key {used_key}: expected mismatch, stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":false}\n");
+        assert!(
+            out.stderr.is_empty(),
+            "a legal-but-changed version must produce no error text"
+        );
+    }
+}
+
+#[test]
+fn verify_json_whitespace_around_members_leaves_version_intact() {
+    let key = "00ff";
+    let body = String::from_utf8(sign_record_bytes(key, "id", "7", &["x"]))
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+
+    // Legal JSON whitespace (space/tab/newline/CR) before and after the member
+    // and around its ':' and value must not change the decoded version or the
+    // verification result.
+    let respaced = body
+        .replacen("{\"format\":1,", "{\n  \"format\"\t: 1 ,", 1)
+        .replacen(
+            "\"key_version\":7",
+            " \r\n\t\"key_version\" : 7  \r\n",
+            1,
+        );
+    let padded = format!("  \t\n{respaced}\r\n  ");
+    let out = run_verify(key, padded.as_bytes());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_illegal_key_version_spellings_exit_2_even_with_a_valid_key() {
+    let key = "00ff";
+    let wrong_key = "ff00";
+    // A correctly signed version-7 record is the template; only the raw JSON
+    // spelling of the version value is then corrupted.
+    let body = String::from_utf8(sign_record_bytes(key, "id", "7", &["kvfield"]))
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+
+    // None of these may be accepted as the integer 7 or silently truncated,
+    // rounded, wrapped or range-rejected into a valid version:
+    //  "7"   - string, not a number
+    //  7.0   - fraction spelling of seven
+    //  7e0   - exponent spelling of seven
+    //  007   - leading zero, corrupt JSON
+    //  0/-1  - outside 1..=4294967295
+    //  4294967296 - one above the upper bound
+    //  40 nines  - far beyond any integer parse range
+    let huge = "9".repeat(40);
+    let spellings: [&str; 8] = [
+        "\"7\"", "7.0", "7e0", "007", "0", "-1", "4294967296", huge.as_str(),
+    ];
+    for spelling in spellings {
+        let rec = body.replacen(
+            "\"key_version\":7",
+            &format!("\"key_version\":{spelling}"),
+            1,
+        );
+        for used_key in [key, wrong_key] {
+            let out = run_verify(used_key, rec.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "spelling {spelling}, key {used_key}: expected exit 2",
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "spelling {spelling}: stdout must be empty, got {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let stderr =
+                String::from_utf8(out.stderr).expect("stderr must be valid UTF-8");
+            let lower = stderr.to_lowercase();
+            assert!(
+                lower.contains("integer") || lower.contains("number") || lower.contains("version"),
+                "spelling {spelling}: stderr must explain the number/version problem: {stderr}"
+            );
+            // An illegal key version is never an unsupported *format* version.
+            assert!(
+                !lower.contains("unsupported"),
+                "spelling {spelling}: bad key_version must not read as unsupported format: {stderr}"
+            );
+            // Error text must not echo the key, the field text, or the whole
+            // input record.
+            assert!(!stderr.contains(used_key), "stderr echoed the key: {stderr}");
+            assert!(!stderr.contains("kvfield"), "stderr echoed a field: {stderr}");
+            assert!(
+                !stderr.contains(&rec),
+                "spelling {spelling}: stderr echoed the record: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sign_accepts_007_but_007_in_a_record_is_corrupt_json() {
+    let key = "00ff";
+
+    // On the command line --key-version is decimal argv text: "007" is parsed
+    // as the integer 7, and the emitted record carries the canonical integer 7.
+    let out = run_sign(key, "id", "007", &["x"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let record = parse_single_record(&out.stdout);
+    assert_eq!(record.key_version, 7, "record must carry the integer 7, not \"007\"");
+    let raw = String::from_utf8(out.stdout).unwrap();
+    assert!(raw.contains("\"key_version\":7"), "wire spelling must be 7: {raw}");
+    assert!(!raw.contains("\"key_version\":007"));
+
+    // That record then verifies normally.
+    let signed = sign_record_bytes(key, "id", "007", &["x"]);
+    let out = run_verify(key, &signed);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // Rewriting the number inside the JSON record to 007 changes it from a
+    // command-line decimal spelling into corrupt JSON: exit 2, not mismatch.
+    let body = std::str::from_utf8(&signed).unwrap().trim_end_matches('\n');
+    let corrupted = body.replacen("\"key_version\":7", "\"key_version\":007", 1);
+    let out = run_verify(key, corrupted.as_bytes());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.to_lowercase().contains("number") || stderr.to_lowercase().contains("integer"),
+        "stderr must explain the number grammar problem: {stderr}"
+    );
+}
+
 #[test]
 fn verify_crossing_empty_field_encodings_fails() {
     let key = "00ff";

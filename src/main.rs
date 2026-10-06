@@ -1071,6 +1071,115 @@ mod tests {
     }
 
     #[test]
+    fn key_version_boundaries_are_normal_versions() {
+        let key = "00ff";
+        // Both endpoints of 1..=4294967295 are ordinary usable versions on a
+        // format-1 record: correct key => Valid.
+        for version in [1u32, 4294967295] {
+            let rec = record_for(key, "id", version, &["x"]);
+            assert!(
+                matches!(verify_input(rec.as_bytes(), key), VerifyOutcome::Valid),
+                "version {version} must verify"
+            );
+            // A legal version with the wrong key is a mismatch, never corrupt
+            // input: picking the wrong key cannot reclassify the record.
+            assert!(
+                matches!(verify_input(rec.as_bytes(), "ff00"), VerifyOutcome::Mismatch),
+                "version {version} with wrong key must mismatch"
+            );
+        }
+
+        // key_version is independent of the format version: a format-1 record
+        // whose key version is not 1 must not be reported as unsupported.
+        let rec = record_for(key, "id", 7, &["x"]);
+        assert!(matches!(
+            verify_input(rec.as_bytes(), key),
+            VerifyOutcome::Valid
+        ));
+
+        // Another in-range integer with the original tag: the record is still
+        // legal but the authenticated content moved, so it is a Mismatch with
+        // the correct key and with the wrong key alike.
+        let v1 = record_for(key, "id", 1, &["x"]);
+        let moved = v1.replace("\"key_version\":1", "\"key_version\":2");
+        assert!(matches!(
+            verify_input(moved.as_bytes(), key),
+            VerifyOutcome::Mismatch
+        ));
+        assert!(matches!(
+            verify_input(moved.as_bytes(), "ff00"),
+            VerifyOutcome::Mismatch
+        ));
+    }
+
+    #[test]
+    fn key_version_illegal_spellings_are_structural_errors() {
+        let key = "00ff";
+        let wrong_key = "ff00";
+        let base = record_for(key, "id", 7, &["kvfield"]);
+        // Every one of these must be rejected at the JSON/record layer:
+        //  - "7" is a string, not an integer
+        //  - 7.0 / 7e0 are fraction/exponent spellings that a tolerant parser
+        //    might quietly round to 7
+        //  - 007 has a leading zero (corrupt JSON, not "the integer 7")
+        //  - 0 / -0 / -1 / 4294967296 fall outside 1..=4294967295
+        //  - the 40-digit decimal is far beyond integer parsing range: it may
+        //    not wrap or truncate into a valid version
+        //  - true / null are not numbers
+        let huge = "9".repeat(40);
+        let bad_spellings = [
+            "\"7\"",
+            "7.0",
+            "7e0",
+            "007",
+            "0",
+            "-0",
+            "-1",
+            "4294967296",
+            huge.as_str(),
+            "true",
+            "null",
+        ];
+        for spelling in bad_spellings {
+            let rec = base.replace(
+                "\"key_version\":7",
+                &format!("\"key_version\":{spelling}"),
+            );
+            // The classification must not depend on which key is supplied: a
+            // valid-but-wrong key leaves an illegal version just as illegal.
+            for used_key in [key, wrong_key] {
+                match verify_input(rec.as_bytes(), used_key) {
+                    VerifyOutcome::Invalid(msg) => {
+                        let lower = msg.to_lowercase();
+                        assert!(
+                            lower.contains("integer")
+                                || lower.contains("number")
+                                || lower.contains("version"),
+                            "message must explain the number/version problem for \
+                             key_version {spelling}: {msg}"
+                        );
+                        // A key version is not a format version: this must
+                        // never be reported as an unsupported record format.
+                        assert!(
+                            !lower.contains("unsupported"),
+                            "illegal key_version is not an unsupported format: {msg}"
+                        );
+                        // The error must not echo the key, the field text or
+                        // the whole record.
+                        assert!(!msg.contains(key), "stderr echoed the key: {msg}");
+                        assert!(!msg.contains(wrong_key), "stderr echoed the key: {msg}");
+                        assert!(!msg.contains("kvfield"), "stderr echoed a field: {msg}");
+                        assert!(!msg.contains(&rec), "stderr echoed the record: {msg}");
+                    }
+                    other => panic!(
+                        "expected Invalid for key_version {spelling}, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn verify_rejects_malformed_and_structurally_bad_records() {
         let key = "00ff";
         let base = record_for(key, "id", 1, &["x"]);
