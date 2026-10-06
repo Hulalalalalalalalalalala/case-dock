@@ -1302,6 +1302,46 @@ mod tests {
     }
 
     #[test]
+    fn json_nesting_is_capped_at_64_containers_along_one_path() {
+        use json::parse_single;
+        // n nested arrays around an (empty) innermost array.
+        let arrays = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        // n nested objects around an integer leaf.
+        let objects = |n: usize| format!("{}1{}", "{\"x\":".repeat(n), "}".repeat(n));
+        // n alternating arrays/objects around an integer leaf.
+        let mixed = |n: usize| {
+            let mut s = String::new();
+            for i in 0..n {
+                s.push_str(if i % 2 == 0 { "[" } else { "{\"x\":" });
+            }
+            s.push('1');
+            for i in (0..n).rev() {
+                s.push_str(if i % 2 == 0 { "]" } else { "}" });
+            }
+            s
+        };
+
+        // Exactly 64 containers along one path parse; the 65th is rejected,
+        // for arrays, objects and the two alternating alike.
+        let builds: [fn(usize) -> String; 3] = [arrays, objects, mixed];
+        for build in builds {
+            assert!(parse_single(&build(64)).is_ok());
+            let err = parse_single(&build(65)).unwrap_err();
+            assert!(
+                err.contains("nesting") && err.contains("deep"),
+                "error must say the nesting is too deep: {err}"
+            );
+        }
+
+        // Sibling containers at one level never add up.
+        let siblings = format!("[{}]", vec!["[]"; 200].join(","));
+        assert!(parse_single(&siblings).is_ok());
+
+        // Brackets and braces inside strings are text, not containers.
+        assert!(parse_single("\"[[[[[[{{{{{{]]]]]]\"").is_ok());
+    }
+
+    #[test]
     fn member_names_compare_by_decoded_text() {
         use json::parse_single;
         // A \u escape spelling of a member name is the same name once

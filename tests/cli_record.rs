@@ -2956,3 +2956,258 @@ fn combining_accent_alone_and_split_fields_are_legal_distinct_messages() {
         assert!(out.stderr.is_empty(), "{label}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// verify: JSON nesting depth limit (regression coverage)
+//
+// Objects and arrays may nest at most 64 levels along a single path: the
+// record object itself is level 1 and its `fields` array is level 2, while
+// string content adds nothing. Deeper input is corrupt input — the run ends
+// normally with exit 2, empty stdout and a stderr that says the nesting is
+// too deep, without echoing the key, field text, member values or the whole
+// record. Input at exactly 64 levels is still judged by the ordinary record
+// rules, sibling containers at one level never add up, and brackets inside
+// strings are just text.
+// ---------------------------------------------------------------------------
+
+/// Distinctive sentinels: none of these may appear in any error message.
+const NEST_KEY: &str = "c0ffeec0ffee";
+const NEST_KID: &str = "sentinel-key-id";
+const NEST_FIELD: &str = "SENTINEL_FIELD_VALUE";
+const NEST_DEEP: &str = "SENTINEL_DEEP_VALUE";
+const NEST_MEMBER: &str = "sentinelmember";
+
+/// `n` nested arrays around `leaf`: [[[...leaf...]]].
+fn nest_arrays(n: usize, leaf: &str) -> String {
+    format!("{}{}{}", "[".repeat(n), leaf, "]".repeat(n))
+}
+
+/// `n` nested objects around `leaf`: {"x":{"x":...leaf...}}.
+fn nest_objects(n: usize, leaf: &str) -> String {
+    format!("{}{}{}", "{\"x\":".repeat(n), leaf, "}".repeat(n))
+}
+
+/// `n` alternating arrays/objects around `leaf`, starting with an array.
+fn nest_mixed(n: usize, leaf: &str) -> String {
+    let mut out = String::new();
+    for i in 0..n {
+        out.push_str(if i % 2 == 0 { "[" } else { "{\"x\":" });
+    }
+    out.push_str(leaf);
+    for i in (0..n).rev() {
+        out.push_str(if i % 2 == 0 { "]" } else { "}" });
+    }
+    out
+}
+
+/// A complete record whose `fields` member is the given raw JSON text.
+fn nest_record_with_fields(fields_json: &str) -> String {
+    format!(
+        r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"{NEST_KID}","key_version":1,"fields":{fields_json},"tag":"{}"}}"#,
+        "a".repeat(64)
+    )
+}
+
+/// A complete record carrying one unexpected member with a raw JSON value.
+fn nest_record_with_extra_member(value_json: &str) -> String {
+    format!(
+        r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"{NEST_KID}","key_version":1,"fields":["{NEST_FIELD}"],"tag":"{}","{NEST_MEMBER}":{value_json}}}"#,
+        "a".repeat(64)
+    )
+}
+
+/// Assert a clean corrupt-input rejection and return stderr: exit 2, empty
+/// stdout, and an explanation that echoes neither the key nor anything from
+/// the input record.
+fn expect_nesting_invalid(input: &str) -> String {
+    let out = run_verify(NEST_KEY, input.as_bytes());
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2, stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "stdout must be empty on exit 2");
+    let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+    assert!(!stderr.trim().is_empty(), "stderr must explain the problem");
+    for leaked in [NEST_KEY, NEST_KID, NEST_FIELD, NEST_DEEP, NEST_MEMBER] {
+        assert!(
+            !stderr.contains(leaked),
+            "stderr echoed {leaked:?}: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains(input),
+        "stderr echoed the whole input record: {stderr}"
+    );
+    stderr
+}
+
+fn assert_says_too_deep(stderr: &str) {
+    let lower = stderr.to_lowercase();
+    assert!(
+        lower.contains("nesting") && lower.contains("deep"),
+        "stderr must say the nesting is too deep: {stderr}"
+    );
+}
+
+fn assert_not_about_nesting(stderr: &str) {
+    let lower = stderr.to_lowercase();
+    assert!(
+        !lower.contains("nesting") && !lower.contains("too deep"),
+        "stderr must not blame nesting depth: {stderr}"
+    );
+}
+
+#[test]
+fn verify_json_nested_65_levels_or_deeper_is_corrupt_input() {
+    let leaf = format!("\"{NEST_DEEP}\"");
+    // The record object itself is level 1, so 64 further containers along one
+    // path reach level 65: arrays, objects and the two alternating all obey
+    // the same limit, wherever in the record the deep content sits.
+    let cases = [
+        nest_record_with_fields(&nest_arrays(64, &leaf)),
+        nest_record_with_fields(&nest_objects(64, &leaf)),
+        nest_record_with_fields(&nest_mixed(64, &leaf)),
+        // Deep content inside a member the record grammar forbids is still
+        // reported as nesting too deep, not as an unexpected member.
+        nest_record_with_extra_member(&nest_mixed(64, &leaf)),
+        nest_record_with_extra_member(&nest_objects(64, &leaf)),
+        // The limit applies to the whole input, not only inside records...
+        nest_arrays(65, "1"),
+        nest_objects(65, "1"),
+        nest_mixed(65, "1"),
+        // ...and far beyond it: the run must end normally, not crash.
+        nest_arrays(10_000, "1"),
+    ];
+    for rec in &cases {
+        let stderr = expect_nesting_invalid(rec);
+        assert_says_too_deep(&stderr);
+    }
+}
+
+#[test]
+fn verify_json_nested_exactly_64_levels_follows_the_record_rules() {
+    // 63 containers inside the record object reach exactly level 64: allowed.
+    // The record is then judged by the ordinary structural rules — a `fields`
+    // element that is an array or object is a field-type problem (exit 2),
+    // never an authentication mismatch and never a nesting error.
+    let cases = [
+        nest_record_with_fields(&nest_arrays(63, "1")),
+        nest_record_with_fields(&nest_objects(63, "1")),
+        nest_record_with_fields(&nest_mixed(63, "1")),
+    ];
+    for rec in &cases {
+        let stderr = expect_nesting_invalid(rec);
+        assert_not_about_nesting(&stderr);
+        assert!(
+            stderr.contains("fields"),
+            "stderr must describe the field-type problem: {stderr}"
+        );
+    }
+
+    // The same depth inside a forbidden member is reported as the member
+    // problem, again without any nesting complaint.
+    let stderr = expect_nesting_invalid(&nest_record_with_extra_member(&nest_mixed(63, "1")));
+    assert_not_about_nesting(&stderr);
+    assert!(
+        stderr.contains("unexpected member"),
+        "stderr must describe the unexpected member: {stderr}"
+    );
+}
+
+#[test]
+fn verify_sibling_containers_at_one_level_do_not_add_up() {
+    // More than 64 containers side by side inside `fields` stay at level 3:
+    // the record is rejected for the field TYPE, not for nesting.
+    for item in ["[]", "{}"] {
+        let fields = format!("[{}]", vec![item; 100].join(","));
+        let stderr = expect_nesting_invalid(&nest_record_with_fields(&fields));
+        assert_not_about_nesting(&stderr);
+        assert!(
+            stderr.contains("fields"),
+            "stderr must describe the field-type problem: {stderr}"
+        );
+    }
+}
+
+/// Quote a string as JSON with every character written as a \uXXXX escape
+/// (ASCII input only): the maximally escaped spelling of the same text.
+fn escape_every_char(s: &str) -> String {
+    assert!(s.is_ascii(), "helper only handles ASCII text");
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        out.push_str(&format!("\\u{:04x}", c as u32));
+    }
+    out.push('"');
+    out
+}
+
+#[test]
+fn verify_brackets_and_quotes_inside_strings_are_not_nesting() {
+    let key = "00ff";
+    // Braces, brackets, quotes and backslashes galore — but all inside JSON
+    // strings, where they are plain text and add no nesting at all.
+    let key_id = "k][}{\"\\id\"";
+    let field = format!(
+        "{}{}{}{}",
+        "[".repeat(200),
+        "{".repeat(150),
+        "\"\\".repeat(80),
+        "]}".repeat(120)
+    );
+    let record = sign_record_bytes(key, key_id, "1", &[&field]);
+
+    let out = run_verify(key, &record);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // The same text written with equivalent JSON escapes keeps the result.
+    let body = String::from_utf8(record).unwrap();
+    let escaped = body
+        .replacen(
+            &json_value_to_text(&Json::Str(key_id.to_string())),
+            &escape_every_char(key_id),
+            1,
+        )
+        .replacen(
+            &json_value_to_text(&Json::Str(field.clone())),
+            &escape_every_char(&field),
+            1,
+        );
+    assert_ne!(escaped, body, "the escape rewrite must change the wire text");
+    let out = run_verify(key, escaped.as_bytes());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_more_than_64_plain_string_fields_verify_normally() {
+    let key = "00ff";
+    // Field COUNT is not nesting depth: 100 ordinary string fields are a
+    // perfectly normal record and verify like any other.
+    let fields: Vec<String> = (0..100).map(|i| format!("field-{i}")).collect();
+    let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+    let record = sign_record_bytes(key, "id", "1", &refs);
+    let out = run_verify(key, &record);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+}
