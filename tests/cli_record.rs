@@ -2657,3 +2657,302 @@ fn long_keys_still_must_be_well_formed_hex() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unicode normalization: "looks the same" is not "is the same message".
+//
+// Format 1 authenticates the raw UTF-8 text of each field. The single
+// character é (U+00E9, precomposed) and the two-character sequence
+// e + U+0301 (letter e followed by COMBINING ACUTE ACCENT) may render
+// identically, but they are different byte sequences and therefore different
+// messages. Both are legal text: each must sign and verify on its own, and
+// neither may be rewritten into the other for the sake of display.
+//
+// Every golden tag below was computed independently with Python's
+// hmac/hashlib/struct straight from the format-1 byte contract in README.md,
+// never derived from this crate's own HMAC code:
+//
+//   precomposed ["\u00e9"]        -> c3 a9          (2 UTF-8 bytes)
+//   composed    ["e\u0301"]       -> 65 cc 81       (3 UTF-8 bytes)
+//   accent alone ["\u0301"]       -> cc 81
+//   two fields  ["e", "\u0301"]  -> 65 / cc 81
+// ---------------------------------------------------------------------------
+
+/// é as one precomposed character (U+00E9).
+const NFC_E: &str = "\u{00e9}";
+/// e followed by U+0301 COMBINING ACUTE ACCENT (two characters).
+const NFD_E: &str = "e\u{0301}";
+/// U+0301 COMBINING ACUTE ACCENT on its own.
+const ACCENT: &str = "\u{0301}";
+
+const NORM_KEY: &str = "00ff";
+const NORM_KID: &str = "id";
+const NORM_VERSION: &str = "1";
+
+/// Golden tag for fields [é] (precomposed, U+00E9).
+const TAG_PRECOMPOSED: &str = "0a0d1264786153d4cee915619413d30a55e0886069d13a4aaccb0290bd20b8de";
+/// Golden tag for fields [e + U+0301] (composed sequence).
+const TAG_COMPOSED: &str = "d7698cf682d11e71b08655ebab11056fbec33480f6665daa2104156866663f01";
+/// Golden tag for fields [U+00E9, "e"+U+0301, U+00E9] (precomposed repeated).
+const TAG_BOTH_REPEAT_PRE: &str = "b645b9145638eab0d912c471bc6522f1ddae765b0421078c7f8a21ae58b0739f";
+/// Golden tag for fields ["e"+U+0301, U+00E9, "e"+U+0301] (composed repeated).
+const TAG_BOTH_REPEAT_COM: &str = "26270edcd121de31632d60e738d23563b2534ec2b1180e81bce9ad0e5d69ea65";
+/// Golden tag for fields [U+0301] (combining accent alone).
+const TAG_ACCENT_ALONE: &str = "02fea2ee40a762e86d37a466529969f7a1d3f16912e24dd7612c200960352113";
+/// Golden tag for fields ["e", U+0301] (letter and accent in separate fields).
+const TAG_LETTER_AND_ACCENT: &str = "c9dc1f7e48b108b2f0f46f8151da4ea44c5f98bf2967be089cb5a31f739726a3";
+
+#[test]
+fn sign_preserves_precomposed_and_composed_spellings_as_distinct_messages() {
+    // Same key, key id, version and field count; only the spelling of the
+    // "same-looking" character differs. Both are legal inputs, both succeed
+    // with the usual contract (exit 0, empty stderr, one JSON line), and the
+    // decoded fields must be character-identical to each input.
+    let pre = expect_signed_record(
+        "precomposed-e",
+        NORM_KEY, NORM_KID, NORM_VERSION, &[NFC_E],
+        TAG_PRECOMPOSED,
+    );
+    let com = expect_signed_record(
+        "composed-e",
+        NORM_KEY, NORM_KID, NORM_VERSION, &[NFD_E],
+        TAG_COMPOSED,
+    );
+
+    // The two spellings are different messages: different authenticated bytes,
+    // different tags. Neither may be normalized into the other.
+    assert_ne!(pre.tag, com.tag);
+    assert_eq!(pre.fields, vec![NFC_E.to_string()]);
+    assert_eq!(com.fields, vec![NFD_E.to_string()]);
+
+    // The wire form keeps the original bytes: the precomposed record carries
+    // c3 a9 and never grows a combining accent; the composed record carries
+    // 65 cc 81 and is never folded into the single precomposed character.
+    let pre_raw = run_sign(NORM_KEY, NORM_KID, NORM_VERSION, &[NFC_E]).stdout;
+    let com_raw = run_sign(NORM_KEY, NORM_KID, NORM_VERSION, &[NFD_E]).stdout;
+    assert!(
+        pre_raw.windows(NFC_E.len()).any(|w| w == NFC_E.as_bytes()),
+        "precomposed record must carry U+00E9 as raw UTF-8: {pre_raw:?}"
+    );
+    assert!(
+        !pre_raw.windows(NFD_E.len()).any(|w| w == NFD_E.as_bytes()),
+        "precomposed record must not contain the composed sequence: {pre_raw:?}"
+    );
+    assert!(
+        com_raw.windows(NFD_E.len()).any(|w| w == NFD_E.as_bytes()),
+        "composed record must carry e + U+0301 as raw UTF-8: {com_raw:?}"
+    );
+    assert!(
+        !com_raw.windows(NFC_E.len()).any(|w| w == NFC_E.as_bytes()),
+        "composed record must not contain the precomposed character: {com_raw:?}"
+    );
+
+    // Each record verifies under the original key with its own tag.
+    for record in [pre_raw, com_raw] {
+        let out = run_verify(NORM_KEY, &record);
+        assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, b"{\"valid\":true}\n");
+        assert!(out.stderr.is_empty());
+    }
+}
+
+#[test]
+fn sign_keeps_both_spellings_and_repeats_in_order_without_merging() {
+    // A record containing BOTH spellings, with one of them repeated: input
+    // order and every occurrence must survive; the look-alike characters must
+    // not be merged, deduplicated or rewritten.
+    let rec = expect_signed_record(
+        "both-repeat-precomposed",
+        NORM_KEY, NORM_KID, NORM_VERSION,
+        &[NFC_E, NFD_E, NFC_E],
+        TAG_BOTH_REPEAT_PRE,
+    );
+    assert_eq!(
+        rec.fields,
+        vec![NFC_E.to_string(), NFD_E.to_string(), NFC_E.to_string()]
+    );
+
+    // Repeating the composed spelling instead is a different message.
+    let rec2 = expect_signed_record(
+        "both-repeat-composed",
+        NORM_KEY, NORM_KID, NORM_VERSION,
+        &[NFD_E, NFC_E, NFD_E],
+        TAG_BOTH_REPEAT_COM,
+    );
+    assert_eq!(
+        rec2.fields,
+        vec![NFD_E.to_string(), NFC_E.to_string(), NFD_E.to_string()]
+    );
+    assert_ne!(rec.tag, rec2.tag);
+}
+
+#[test]
+fn verify_respelled_unicode_escapes_keep_the_original_tag_valid() {
+    // U+00E9 written directly or as \u00e9, and the composed sequence written
+    // directly or as e\u0301, decode to the same character sequence: the
+    // original tag stays valid (exit 0, {"valid":true}, empty stderr). This
+    // is a JSON spelling change, not a message change.
+    let pre_record = sign_record_bytes(NORM_KEY, NORM_KID, NORM_VERSION, &[NFC_E]);
+    let pre_body = String::from_utf8(pre_record).unwrap();
+    let pre_escaped = pre_body.replacen(NFC_E, "\\u00e9", 1);
+    assert_ne!(pre_escaped, pre_body, "the escape rewrite must change the wire text");
+
+    let com_record = sign_record_bytes(NORM_KEY, NORM_KID, NORM_VERSION, &[NFD_E]);
+    let com_body = String::from_utf8(com_record).unwrap();
+    let com_escaped = com_body.replacen(NFD_E, "e\\u0301", 1);
+    assert_ne!(com_escaped, com_body, "the escape rewrite must change the wire text");
+
+    for (label, text) in [
+        ("precomposed direct", pre_body.as_str()),
+        ("precomposed escaped", pre_escaped.as_str()),
+        ("composed direct", com_body.as_str()),
+        ("composed escaped", com_escaped.as_str()),
+    ] {
+        let out = run_verify(NORM_KEY, text.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{label}: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}");
+    }
+
+    // Records produced entirely OUTSIDE this tool, carrying the independent
+    // Python golden tags, verify the same way — in both direct and fully
+    // escaped ASCII-only spellings. Compatibility is anchored to the
+    // published format-1 contract, not to self-consistency.
+    let external_pre = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{NORM_KID}\",\"key_version\":1,\"fields\":[\"{NFC_E}\"],\"tag\":\"{TAG_PRECOMPOSED}\"}}"
+    );
+    let external_pre_escaped = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{NORM_KID}\",\"key_version\":1,\"fields\":[\"\\u00e9\"],\"tag\":\"{TAG_PRECOMPOSED}\"}}"
+    );
+    assert!(external_pre_escaped.is_ascii());
+    let external_com = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{NORM_KID}\",\"key_version\":1,\"fields\":[\"{NFD_E}\"],\"tag\":\"{TAG_COMPOSED}\"}}"
+    );
+    let external_com_escaped = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{NORM_KID}\",\"key_version\":1,\"fields\":[\"e\\u0301\"],\"tag\":\"{TAG_COMPOSED}\"}}"
+    );
+    assert!(external_com_escaped.is_ascii());
+    for (label, text) in [
+        ("external precomposed direct", external_pre),
+        ("external precomposed escaped", external_pre_escaped),
+        ("external composed direct", external_com),
+        ("external composed escaped", external_com_escaped),
+    ] {
+        let out = run_verify(NORM_KEY, text.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{label}: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}");
+    }
+}
+
+#[test]
+fn verify_swapping_precomposed_and_composed_is_a_mismatch_in_both_directions() {
+    // Replacing ONLY the precomposed character with the composed sequence (or
+    // vice versa) while keeping the original tag and every other member: the
+    // record stays structurally legal JSON, but the authenticated message
+    // changed, so the result must be exit 1, {"valid":false}, empty stderr —
+    // never exit 2 and never valid. Both directions, and both the raw-UTF-8
+    // and the \u00e9-spelled replacement, obey this rule.
+    let pre_body = String::from_utf8(sign_record_bytes(NORM_KEY, NORM_KID, NORM_VERSION, &[NFC_E]))
+        .unwrap();
+    let com_body = String::from_utf8(sign_record_bytes(NORM_KEY, NORM_KID, NORM_VERSION, &[NFD_E]))
+        .unwrap();
+
+    let swapped: Vec<(&str, String)> = vec![
+        // precomposed record, field rewritten to the composed sequence
+        ("pre->com raw", pre_body.replacen(NFC_E, NFD_E, 1)),
+        ("pre->com escaped", pre_body.replacen(NFC_E, "e\\u0301", 1)),
+        // composed record, field rewritten to the precomposed character
+        ("com->pre raw", com_body.replacen(NFD_E, NFC_E, 1)),
+        ("com->pre escaped", com_body.replacen(NFD_E, "\\u00e9", 1)),
+    ];
+    for (label, text) in &swapped {
+        let out = run_verify(NORM_KEY, text.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{label}: expected mismatch (exit 1), stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":false}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}: mismatch must be silent on stderr");
+    }
+}
+
+#[test]
+fn combining_accent_alone_and_split_fields_are_legal_distinct_messages() {
+    // A combining accent with no preceding letter is still legal text: as a
+    // field on its own it signs and verifies like any other message, not a
+    // format error.
+    let alone = expect_signed_record(
+        "accent-alone",
+        NORM_KEY, NORM_KID, NORM_VERSION, &[ACCENT],
+        TAG_ACCENT_ALONE,
+    );
+    assert_eq!(alone.fields, vec![ACCENT.to_string()]);
+    let alone_raw = run_sign(NORM_KEY, NORM_KID, NORM_VERSION, &[ACCENT]).stdout;
+    let out = run_verify(NORM_KEY, &alone_raw);
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // An external record carrying the accent as an escape with the golden tag
+    // verifies too: a lone combining mark is not corruption.
+    let external_alone = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{NORM_KID}\",\"key_version\":1,\"fields\":[\"\\u0301\"],\"tag\":\"{TAG_ACCENT_ALONE}\"}}"
+    );
+    assert!(external_alone.is_ascii());
+    let out = run_verify(NORM_KEY, external_alone.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // Letter and accent in TWO fields is a different message from the
+    // composed sequence in ONE field: field boundaries are authenticated, so
+    // the two forms must not share a tag.
+    let split = expect_signed_record(
+        "letter-and-accent-two-fields",
+        NORM_KEY, NORM_KID, NORM_VERSION, &["e", ACCENT],
+        TAG_LETTER_AND_ACCENT,
+    );
+    assert_eq!(split.fields, vec!["e".to_string(), ACCENT.to_string()]);
+    assert_ne!(split.tag, TAG_COMPOSED);
+
+    // The split record verifies with its own tag...
+    let split_raw = run_sign(NORM_KEY, NORM_KID, NORM_VERSION, &["e", ACCENT]).stdout;
+    let out = run_verify(NORM_KEY, &split_raw);
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // ...but crossing the boundary in either direction with the other form's
+    // tag is a plain mismatch, not corrupt input.
+    let split_body = String::from_utf8(split_raw).unwrap();
+    let merged = split_body.replacen("\"e\",\"\u{0301}\"", "\"e\u{0301}\"", 1);
+    assert_ne!(merged, split_body, "the field merge must change the record");
+    let com_body = String::from_utf8(sign_record_bytes(NORM_KEY, NORM_KID, NORM_VERSION, &[NFD_E]))
+        .unwrap();
+    let split_apart = com_body.replacen("\"e\u{0301}\"", "\"e\",\"\u{0301}\"", 1);
+    assert_ne!(split_apart, com_body, "the field split must change the record");
+    for (label, text) in [("merged fields, old tag", merged), ("split field, old tag", split_apart)] {
+        let out = run_verify(NORM_KEY, text.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{label}: expected mismatch (exit 1), stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":false}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}");
+    }
+}
