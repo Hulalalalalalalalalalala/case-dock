@@ -1315,4 +1315,76 @@ mod tests {
         // Distinct decoded names stay distinct, escape spelling or not.
         assert!(parse_single("{\"a\":1,\"\\u0062\":2}").is_ok());
     }
+
+    // -- JSON nesting cap (objects and arrays share one depth budget) ------
+
+    /// `n` nested arrays (`[[[1]]]` for n=3).
+    fn nested_arrays(n: usize) -> String {
+        let mut s = String::from("1");
+        for _ in 0..n {
+            s = format!("[{s}]");
+        }
+        s
+    }
+
+    /// `n` nested objects (`{"a":{"a":1}}` for n=3). Each object holds a
+    /// single member, so the repeated "a" names live in different objects and
+    /// never trip the within-one-object duplicate-member rule.
+    fn nested_objects(n: usize) -> String {
+        let mut s = String::from("1");
+        for _ in 0..n {
+            s = format!("{{\"a\":{s}}}");
+        }
+        s
+    }
+
+    /// `n` containers alternating object/array from the outside in, starting
+    /// with an object (`{"a":[1]}` for n=2).
+    fn nested_alternating(n: usize) -> String {
+        let mut s = String::from("1");
+        for depth in (1..=n).rev() {
+            // Odd positions from the outside (depth counted from the outermost
+            // container) are objects; even positions are arrays.
+            s = if depth % 2 == 1 {
+                format!("{{\"a\":{s}}}")
+            } else {
+                format!("[{s}]")
+            };
+        }
+        s
+    }
+
+    #[test]
+    fn parser_accepts_exactly_max_nesting_and_rejects_one_more() {
+        use json::parse_single;
+        // Depth counts only objects and arrays on one enclosing path. 64 is
+        // the cap and must parse; 65 is corrupt input with a message that
+        // names the nesting problem. This holds for objects, arrays and an
+        // object/array alternation alike.
+        for build in [nested_arrays, nested_objects, nested_alternating] {
+            assert!(parse_single(&build(64)).is_ok(), "depth 64 must parse");
+            let err = parse_single(&build(65)).unwrap_err();
+            assert!(
+                err.to_lowercase().contains("nesting"),
+                "depth 65 must be reported as nesting, got: {err}"
+            );
+            // Well beyond the cap the outcome is identical, not a crash.
+            assert!(parse_single(&build(200)).is_err());
+        }
+    }
+
+    #[test]
+    fn parser_strings_and_siblings_do_not_add_depth() {
+        use json::parse_single;
+        // A deeply nested JSON *string* is still one scalar: the bracket
+        // characters inside it are text, not containers, so they never count
+        // toward the depth budget.
+        let as_string = format!("\"{}\"", nested_arrays(300));
+        assert!(parse_single(&as_string).is_ok(), "brackets inside a string are not nesting");
+
+        // Many parallel shallow containers share the same level instead of
+        // adding up: well over 64 siblings must still parse.
+        let siblings = format!("[{}]", vec!["[]"; 200].join(","));
+        assert!(parse_single(&siblings).is_ok(), "siblings do not sum depth");
+    }
 }

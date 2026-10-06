@@ -593,6 +593,284 @@ fn verify_option_errors_match_sign_and_never_echo_secrets() {
 
 
 // ---------------------------------------------------------------------------
+// verify: JSON nesting cap (objects and arrays, at most 64 levels deep)
+//
+// Depth counts only objects and arrays that enclose content on one path: the
+// outermost record object is level 1 and the usual `fields` array is level 2;
+// JSON strings add no level and siblings on the same level do not add up.
+// Input complete to depth 65 or deeper is corrupt input (exit 2, empty
+// stdout, a message that names the nesting problem), never a mismatch and
+// never a crash. Input at exactly depth 64 is parsed normally and judged by
+// the ordinary record rules.
+// ---------------------------------------------------------------------------
+
+/// Markers used in the hand-authored nesting records; none may appear in an
+/// error message.
+const NEST_KEY: &str = "00ff";
+const NEST_KID: &str = "depthprobe";
+const NEST_EXTRA_MEMBER: &str = "x1";
+/// 64-character placeholder tag (not a valid authentication of anything).
+fn nest_tag() -> String {
+    "c".repeat(64)
+}
+
+/// Wrap `leaf` in `n` containers, kind taken per level from `kinds` (cycled):
+/// `'['` makes an array, `'{'` an object with one member `"a"`. Level 0 is the
+/// outermost wrapper, so `kinds` reads outside-in.
+fn nested_containers(kinds: &str, n: usize, leaf: &str) -> String {
+    let mut s = leaf.to_string();
+    for i in (0..n).rev() {
+        s = match kinds.as_bytes()[i % kinds.len()] {
+            b'[' => format!("[{s}]"),
+            b'{' => format!("{{\"a\":{s}}}"),
+            other => panic!("unknown container kind {}", other as char),
+        };
+    }
+    s
+}
+
+/// One complete record whose single `fields` element is `element_json`.
+fn record_with_fields_element(element_json: &str) -> String {
+    format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{NEST_KID}\",\
+         \"key_version\":1,\"fields\":[{element_json}],\"tag\":\"{}\"}}",
+        nest_tag()
+    )
+}
+
+/// Assert the corrupt-input contract for a too-deep record: exit 2, empty
+/// stdout, and a stderr that explains the nesting specifically without
+/// echoing the key or any record content.
+fn expect_too_deep(label: &str, input: &str) {
+    let stderr = expect_verify_invalid(input.as_bytes(), &["--key", NEST_KEY]);
+    let lower = stderr.to_lowercase();
+    assert!(
+        lower.contains("nesting") || lower.contains("deep"),
+        "{label}: stderr must explain that nesting is too deep: {stderr}"
+    );
+    // Nothing from the input is quoted back: not the key, key id, a member
+    // name/value, the tag, or the full record.
+    assert!(!stderr.contains(NEST_KEY), "{label}: stderr echoed the key: {stderr}");
+    assert!(!stderr.contains(NEST_KID), "{label}: stderr echoed key id: {stderr}");
+    assert!(
+        !stderr.contains(&nest_tag()),
+        "{label}: stderr echoed the tag/record: {stderr}"
+    );
+    assert!(
+        stderr.len() < input.len(),
+        "{label}: stderr must not quote the whole record back: {stderr}"
+    );
+}
+
+#[test]
+fn verify_nesting_at_or_below_64_is_not_reported_as_too_deep() {
+    // A fields element carrying exactly 62 extra containers sits at total
+    // depth 64 (record 1 + fields array 2 + 62). It must NOT be reported as
+    // nesting; the ordinary record rules apply and reject the non-string
+    // element structurally: exit 2, never exit 1, with no nesting wording.
+    for kinds in ["[", "{", "{["] {
+        let element = nested_containers(kinds, 62, "1");
+        // Sanity: this is genuinely 64 containers on the one path.
+        let opens = element.chars().filter(|c| *c == '[' || *c == '{').count();
+        assert_eq!(opens, 62);
+        let rec = record_with_fields_element(&element);
+        let stderr = expect_verify_invalid(rec.as_bytes(), &["--key", NEST_KEY]);
+        let lower = stderr.to_lowercase();
+        assert!(
+            !lower.contains("nesting") && !lower.contains("deep"),
+            "depth 64 must not be reported as too deep ({kinds:?}): {stderr}"
+        );
+        assert!(
+            lower.contains("fields") && lower.contains("string"),
+            "the fields element type must be the reported problem ({kinds:?}): {stderr}"
+        );
+    }
+}
+
+#[test]
+fn verify_nesting_65_and_beyond_is_corrupt_input() {
+    // Complete JSON at depth 65 or deeper: arrays only, objects only, and
+    // object/array alternation all share the one depth budget. These stand
+    // alone values are not records at all, but the depth check fires first.
+    for kinds in ["[", "{", "{["] {
+        for depth in [65usize, 66, 200] {
+            let input = nested_containers(kinds, depth, "1");
+            expect_too_deep(&format!("standalone {kinds:?} depth {depth}"), &input);
+        }
+    }
+
+    // Depth 65 reached INSIDE a record through a fields element: record (1) +
+    // fields array (2) + 63 containers = 65. Both array and object tails.
+    for kinds in ["[", "{", "{["] {
+        let rec = record_with_fields_element(&nested_containers(kinds, 63, "1"));
+        expect_too_deep(&format!("fields element {kinds:?} total depth 65"), &rec);
+    }
+
+    // Deep content in a member where such content is otherwise illegal must
+    // still surface as nesting, not as the member-specific problem: an
+    // unexpected extra member (record + 64 arrays = 65) ...
+    let extra_deep = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{NEST_KID}\",\
+         \"key_version\":1,\"fields\":[],\"tag\":\"{}\",\"{NEST_EXTRA_MEMBER}\":{}}}",
+        nest_tag(),
+        nested_containers("[", 64, "1"),
+    );
+    expect_too_deep("unexpected member holding depth-64 value", &extra_deep);
+    // ... and the unexpected member's name/value must not be quoted back.
+    let out = run_verify(NEST_KEY, extra_deep.as_bytes());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(NEST_EXTRA_MEMBER),
+        "stderr echoed the unexpected member name: {stderr}"
+    );
+
+    // ... and depth 65 where "format" should be an integer: the parser
+    // rejects the nesting before any type check can run.
+    let format_deep = format!(
+        "{{\"format\":{},\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{NEST_KID}\",\
+         \"key_version\":1,\"fields\":[],\"tag\":\"{}\"}}",
+        nested_containers("{", 64, "1"),
+        nest_tag(),
+    );
+    expect_too_deep("format value at total depth 65", &format_deep);
+}
+
+#[test]
+fn verify_sibling_containers_do_not_accumulate_depth() {
+    // Parallel containers at the same level are separate paths: more than 64
+    // of them side by side must stay well within the depth budget. The
+    // records are still structurally illegal (fields elements must be
+    // strings), reported as the field-type problem — never as nesting and
+    // never as a mismatch.
+    for element in ["[]", "{}"] {
+        let rec = format!(
+            "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{NEST_KID}\",\
+             \"key_version\":1,\"fields\":[{}],\"tag\":\"{}\"}}",
+            vec![element; 70].join(","),
+            nest_tag(),
+        );
+        let stderr = expect_verify_invalid(rec.as_bytes(), &["--key", NEST_KEY]);
+        let lower = stderr.to_lowercase();
+        assert!(
+            !lower.contains("nesting") && !lower.contains("deep"),
+            "70 sibling {element} must not add up in depth: {stderr}"
+        );
+        assert!(
+            lower.contains("fields") && lower.contains("string"),
+            "sibling {element} elements must be reported as bad field types: {stderr}"
+        );
+    }
+}
+
+/// Render `s` as a JSON string whose JSON-structural punctuation is spelled
+/// with equivalent `\uXXXX` escapes (`[` `]` `{` `}` `"` `\`). The decoded
+/// text is unchanged; the bytes on the wire contain none of those marks.
+fn json_string_with_unicode_punct(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\u0022"),
+            '\\' => out.push_str("\\u005c"),
+            '[' => out.push_str("\\u005b"),
+            ']' => out.push_str("\\u005d"),
+            '{' => out.push_str("\\u007b"),
+            '}' => out.push_str("\\u007d"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[test]
+fn verify_bracket_brace_quote_laden_string_content_stays_valid() {
+    // Piles of brackets, braces and quotes are ordinary text INSIDE JSON
+    // strings: they add no nesting, and a record carrying them must verify
+    // with the original key: one {"valid":true} line, exit 0, empty stderr.
+    let key = "a1b2a1b2a1b2a1b2a1b2a1b2a1b2a1b2";
+    let key_id = format!("k[{{}}]\"{}", "x".repeat(40));
+    let field0 = format!("[]{{}}\"{}", "q".repeat(80));
+    let field1 = "\"{[[]]}\"".repeat(30);
+    let fields = [field0.as_str(), field1.as_str(), "plain"];
+
+    let signed = run_sign(key, &key_id, "9", &fields);
+    assert_eq!(signed.status.code(), Some(0));
+    let stdout = signed.stdout;
+    let body = String::from_utf8(stdout.clone()).unwrap();
+    let tag = Json::parse(body.trim_end_matches('\n')).get("tag").as_str().to_string();
+
+    // (1) The record sign produced verifies directly (punctuation appears
+    // with ordinary JSON escapes such as \").
+    let out = run_verify(key, &stdout);
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // (2) The same decoded content with every mark respelled as an
+    // equivalent \u escape verifies identically: escaping is not a content
+    // change. The distinctive raw content fragments must be absent on the
+    // wire (the marks travel as \uXXXX instead), while the record's own
+    // structural delimiters of course stay raw.
+    let escaped_fields = fields
+        .iter()
+        .map(|f| json_string_with_unicode_punct(f))
+        .collect::<Vec<_>>()
+        .join(",");
+    let escaped = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":{},\
+         \"key_version\":9,\"fields\":[{escaped_fields}],\"tag\":\"{tag}\"}}",
+        json_string_with_unicode_punct(&key_id),
+    );
+    for raw_fragment in ["[]{}\"", "k[{}]", "\"{[[]]}\""] {
+        assert!(
+            !escaped.contains(raw_fragment),
+            "content fragment {raw_fragment:?} must be \\u-escaped on the wire: {escaped}"
+        );
+    }
+    let out = run_verify(key, escaped.as_bytes());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "escaped punctuation must verify: stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // Under the wrong key the same record is a plain mismatch: the unusual
+    // text never tips it into structural rejection.
+    let out = run_verify("a1b2a1b2a1b2a1b2a1b2a1b2a1b2a1b3", escaped.as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_more_than_64_plain_string_fields_stays_valid() {
+    // Field COUNT is unrelated to container depth: 70 ordinary string fields
+    // (more than the nesting cap) verify like any other record.
+    let key = "00ff";
+    let fields: Vec<String> = (0..70).map(|i| format!("field-{i}")).collect();
+    let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+    let record = sign_record_bytes(key, "id", "1", &field_refs);
+    let out = run_verify(key, &record);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // The same 70 fields under a wrong key is a mismatch, not corruption.
+    let out = run_verify("0100", &record);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+    assert!(out.stderr.is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // Minimal JSON parser (objects, arrays, strings, integers, true/false/null).
 // ---------------------------------------------------------------------------
 
