@@ -2,17 +2,111 @@ use std::env;
 use std::io::Read;
 use std::process::ExitCode;
 
-use hmac::{
-    Hmac, Mac,
-    digest::KeyInit,
-};
-use sha2::Sha256;
+/// Authentication core shared by `sign` and `verify`.
+///
+/// This module owns everything about *computing* format-1 tags: key
+/// validation and decoding, the canonical byte encoding of the authenticated
+/// content, the HMAC-SHA256 computation itself, and constant-time tag
+/// comparison. It knows nothing about command lines, JSON records, standard
+/// output or exit codes — the subcommands own all of that presentation and
+/// map these results to output lines and exit statuses.
+mod auth {
+    use hmac::{
+        Hmac, Mac,
+        digest::KeyInit,
+    };
+    use sha2::Sha256;
 
-const FORMAT_VERSION: u32 = 1;
-const ALGORITHM: &str = "HMAC-SHA256";
-/// Domain separator that also records the format version, so tags computed
-/// by different versions of the encoding can never collide.
-const DOMAIN_SEPARATOR: &[u8] = b"authnote-sign-v1";
+    /// Record format version written by `sign` and required by `verify`.
+    pub const FORMAT_VERSION: u32 = 1;
+    /// Algorithm name written by `sign` and required by `verify`.
+    pub const ALGORITHM: &str = "HMAC-SHA256";
+    /// Domain separator that also records the format version, so tags computed
+    /// by different versions of the encoding can never collide.
+    const DOMAIN_SEPARATOR: &[u8] = b"authnote-sign-v1";
+
+    /// One computed authentication tag: a full HMAC-SHA256 output.
+    pub type Tag = [u8; 32];
+
+    /// Shared key validation for `sign` and `verify`: non-empty even-length
+    /// hex. The rejected value is never included in the message.
+    pub fn validate_key_hex(key: &str) -> Result<(), String> {
+        if key.is_empty() || key.len() % 2 != 0 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("--key must be a non-empty, even-length hexadecimal string".to_string());
+        }
+        Ok(())
+    }
+
+    /// Decode key text that has passed `validate_key_hex` into raw bytes.
+    /// The bytes feed the MAC only; they never appear in any record.
+    pub fn decode_key(hex: &str) -> Vec<u8> {
+        decode_hex(hex).expect("key was validated as hex")
+    }
+
+    /// Compute the format-1 authentication tag over the given content.
+    ///
+    /// Both `sign` (to emit a tag) and `verify` (to recompute the expected
+    /// tag) go through this single path, so the two can never drift apart.
+    pub fn compute_tag(key: &[u8], key_id: &str, key_version: u32, fields: &[String]) -> Tag {
+        let message = encode_message(key_id, key_version, fields);
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
+            .expect("HMAC accepts keys of any length");
+        mac.update(&message);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Compare a recomputed tag with the tag from a record, in constant time
+    /// so a mismatch cannot be recovered one byte at a time through timing.
+    pub fn tags_match(expected: &Tag, given: &[u8]) -> bool {
+        if expected.len() != given.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (a, b) in expected.iter().zip(given.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+
+    /// Canonical byte encoding of the authenticated content.
+    ///
+    /// Layout (all integers big-endian, all text UTF-8, no trimming or escaping):
+    ///   DOMAIN_SEPARATOR ("authnote-sign-v1", 16 ASCII bytes)
+    ///   u64 length of key-id, then key-id bytes
+    ///   u32 key version
+    ///   u64 field count
+    ///   for each field in order: u64 length of field, then field bytes
+    ///
+    /// Length prefixes make field boundaries unambiguous: ["ab","c"] and
+    /// ["a","bc"] encode differently, as do zero fields and one empty field.
+    fn encode_message(key_id: &str, key_version: u32, fields: &[String]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(DOMAIN_SEPARATOR);
+        push_len_prefixed(&mut out, key_id.as_bytes());
+        out.extend_from_slice(&key_version.to_be_bytes());
+        out.extend_from_slice(&(fields.len() as u64).to_be_bytes());
+        for field in fields {
+            push_len_prefixed(&mut out, field.as_bytes());
+        }
+        out
+    }
+
+    fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+
+    pub fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    pub fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = match decode_args() {
@@ -170,27 +264,10 @@ mod options {
 fn sign(args: &[String]) -> ExitCode {
     match parse_sign_args(args).and_then(validate_sign_args) {
         Ok(opts) => {
-            let key_bytes = decode_hex(&opts.key).expect("key was validated as hex");
+            let key_bytes = auth::decode_key(&opts.key);
             let key_version: u32 = opts.key_version.parse().expect("version was validated");
-            let message = encode_message(&opts.key_id, key_version, &opts.fields);
-            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key_bytes)
-                .expect("HMAC accepts keys of any length");
-            mac.update(&message);
-            let tag = mac.finalize().into_bytes();
-
-            let fields_json = opts
-                .fields
-                .iter()
-                .map(|f| format!("\"{}\"", json_escape(f)))
-                .collect::<Vec<_>>()
-                .join(",");
-            println!(
-                "{{\"format\":{FORMAT_VERSION},\"algorithm\":\"{ALGORITHM}\",\"key_id\":\"{}\",\"key_version\":{},\"fields\":[{}],\"tag\":\"{}\"}}",
-                json_escape(&opts.key_id),
-                key_version,
-                fields_json,
-                hex_encode(&tag),
-            );
+            let tag = auth::compute_tag(&key_bytes, &opts.key_id, key_version, &opts.fields);
+            println!("{}", render_record(&opts.key_id, key_version, &opts.fields, &tag));
             ExitCode::SUCCESS
         }
         Err(msg) => {
@@ -198,6 +275,28 @@ fn sign(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Render one format-1 record as the single JSON line `sign` prints.
+///
+/// Pure presentation: member order, escaping, lowercase tag hex and the
+/// trailing newline (added by the caller's `println!`) are fixed here. The
+/// key is not a parameter — it never enters the record.
+fn render_record(key_id: &str, key_version: u32, fields: &[String], tag: &auth::Tag) -> String {
+    let fields_json = fields
+        .iter()
+        .map(|f| format!("\"{}\"", json_escape(f)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"format\":{},\"algorithm\":\"{}\",\"key_id\":\"{}\",\"key_version\":{},\"fields\":[{}],\"tag\":\"{}\"}}",
+        auth::FORMAT_VERSION,
+        auth::ALGORITHM,
+        json_escape(key_id),
+        key_version,
+        fields_json,
+        auth::hex_encode(tag),
+    )
 }
 
 struct SignOptions {
@@ -261,7 +360,7 @@ fn parse_sign_args(args: &[String]) -> Result<SignOptions, String> {
 
 fn validate_sign_args(opts: SignOptions) -> Result<SignOptions, String> {
     // Never echo the key back in error messages.
-    validate_key_hex(&opts.key)?;
+    auth::validate_key_hex(&opts.key)?;
     if opts.key_id.is_empty() {
         return Err("--key-id must not be empty".to_string());
     }
@@ -275,15 +374,6 @@ fn validate_sign_args(opts: SignOptions) -> Result<SignOptions, String> {
         return Err("--key-version must be a decimal integer between 1 and 4294967295".to_string());
     }
     Ok(opts)
-}
-
-/// Shared key validation for `sign` and `verify`: non-empty even-length hex.
-/// The rejected value is never included in the message.
-fn validate_key_hex(key: &str) -> Result<(), String> {
-    if key.is_empty() || key.len() % 2 != 0 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("--key must be a non-empty, even-length hexadecimal string".to_string());
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +398,7 @@ fn verify(args: &[String]) -> ExitCode {
             .first()
             .map(|o| o.value.clone())
             .ok_or("missing required option --key")?;
-        validate_key_hex(&key)?;
+        auth::validate_key_hex(&key)?;
         Ok(key)
     })();
 
@@ -370,26 +460,15 @@ fn verify_input(input: &[u8], key_hex: &str) -> VerifyOutcome {
         Err(msg) => return VerifyOutcome::Invalid(msg),
     };
 
-    let key_bytes = decode_hex(key_hex).expect("key was validated as hex");
-    let message = encode_message(&record.key_id, record.key_version, &record.fields);
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key_bytes)
-        .expect("HMAC accepts keys of any length");
-    mac.update(&message);
+    let key_bytes = auth::decode_key(key_hex);
+    let expected_tag = auth::compute_tag(
+        &key_bytes,
+        &record.key_id,
+        record.key_version,
+        &record.fields,
+    );
 
-    let expected_tag = mac.finalize().into_bytes();
-    let given_tag = &record.tag;
-
-    // Both sides are 32 bytes; compare in constant time so a mismatch cannot
-    // be recovered one byte at a time through timing.
-    debug_assert_eq!(expected_tag.len(), given_tag.len());
-    if expected_tag.len() != given_tag.len() {
-        return VerifyOutcome::Mismatch;
-    }
-    let mut diff = 0u8;
-    for (a, b) in expected_tag.iter().zip(given_tag.iter()) {
-        diff |= a ^ b;
-    }
-    if diff == 0 {
+    if auth::tags_match(&expected_tag, &record.tag) {
         VerifyOutcome::Valid
     } else {
         VerifyOutcome::Mismatch
@@ -401,7 +480,7 @@ fn decode_tag(s: &str) -> Result<Vec<u8>, String> {
     if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("tag must be exactly 64 hexadecimal characters (32 bytes)".to_string());
     }
-    decode_hex(s).map_err(|e| format!("tag is not valid hexadecimal: {e}"))
+    auth::decode_hex(s).map_err(|e| format!("tag is not valid hexadecimal: {e}"))
 }
 
 struct AuthRecord {
@@ -454,7 +533,7 @@ fn record_from_json(value: &json::JsonValue) -> Result<AuthRecord, String> {
     // not silently fall back to the current rules and compute a result.
     let format = format.ok_or("record is missing required member \"format\"")?;
     match format {
-        json::JsonValue::Number(n) if *n == i128::from(FORMAT_VERSION) => {}
+        json::JsonValue::Number(n) if *n == i128::from(auth::FORMAT_VERSION) => {}
         json::JsonValue::Number(_) => {
             return Err("unsupported record format version; only format 1 is supported".to_string())
         }
@@ -463,7 +542,7 @@ fn record_from_json(value: &json::JsonValue) -> Result<AuthRecord, String> {
 
     let algorithm = algorithm.ok_or("record is missing required member \"algorithm\"")?;
     match algorithm {
-        json::JsonValue::String(s) if s == ALGORITHM => {}
+        json::JsonValue::String(s) if s == auth::ALGORITHM => {}
         json::JsonValue::String(_) => {
             return Err(
                 "unsupported algorithm in record; only HMAC-SHA256 is supported".to_string(),
@@ -526,45 +605,6 @@ fn record_from_json(value: &json::JsonValue) -> Result<AuthRecord, String> {
         fields,
         tag,
     })
-}
-
-/// Canonical byte encoding of the authenticated content.
-///
-/// Layout (all integers big-endian, all text UTF-8, no trimming or escaping):
-///   DOMAIN_SEPARATOR ("authnote-sign-v1", 16 ASCII bytes)
-///   u64 length of key-id, then key-id bytes
-///   u32 key version
-///   u64 field count
-///   for each field in order: u64 length of field, then field bytes
-///
-/// Length prefixes make field boundaries unambiguous: ["ab","c"] and
-/// ["a","bc"] encode differently, as do zero fields and one empty field.
-fn encode_message(key_id: &str, key_version: u32, fields: &[String]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(DOMAIN_SEPARATOR);
-    push_len_prefixed(&mut out, key_id.as_bytes());
-    out.extend_from_slice(&key_version.to_be_bytes());
-    out.extend_from_slice(&(fields.len() as u64).to_be_bytes());
-    for field in fields {
-        push_len_prefixed(&mut out, field.as_bytes());
-    }
-    out
-}
-
-fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-    out.extend_from_slice(bytes);
-}
-
-fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn json_escape(s: &str) -> String {
@@ -924,22 +964,21 @@ mod tests {
     use super::*;
 
     fn sign_tag(key_hex: &str, key_id: &str, version: u32, fields: &[&str]) -> String {
-        let key = decode_hex(key_hex).unwrap();
+        let key = auth::decode_key(key_hex);
         let owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-        let msg = encode_message(key_id, version, &owned);
-        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key).unwrap();
-        mac.update(&msg);
-        hex_encode(&mac.finalize().into_bytes())
+        auth::hex_encode(&auth::compute_tag(&key, key_id, version, &owned))
     }
 
     #[test]
     // RFC 4231 test case 1: HMAC-SHA256 with key 0x0b*20, data "Hi There".
     fn hmac_matches_rfc4231() {
-        let key = decode_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        use hmac::{Hmac, Mac, digest::KeyInit};
+        use sha2::Sha256;
+        let key = auth::decode_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
         let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key).unwrap();
         mac.update(b"Hi There");
         assert_eq!(
-            hex_encode(&mac.finalize().into_bytes()),
+            auth::hex_encode(&mac.finalize().into_bytes()),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
     }
@@ -949,11 +988,13 @@ mod tests {
     // 64-byte SHA-256 block, so the key itself is hashed first), data
     // "Test Using Larger Than Block-Size Key - Hash Key First".
     fn hmac_long_key_matches_rfc4231() {
+        use hmac::{Hmac, Mac, digest::KeyInit};
+        use sha2::Sha256;
         let key = vec![0xaau8; 131];
         let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key).unwrap();
         mac.update(b"Test Using Larger Than Block-Size Key - Hash Key First");
         assert_eq!(
-            hex_encode(&mac.finalize().into_bytes()),
+            auth::hex_encode(&mac.finalize().into_bytes()),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
     }
