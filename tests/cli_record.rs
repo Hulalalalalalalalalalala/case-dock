@@ -1078,6 +1078,444 @@ fn byte_length_not_character_count_is_authenticated() {
 }
 
 // ---------------------------------------------------------------------------
+// sign: the two option value spellings `--opt value` and `--opt=value`,
+// including command lines that mix the two.
+//
+// Every option accepts both spellings and they must be indistinguishable:
+// same actual key / key-id / version / ordered fields must produce a byte
+// identical one-line record (and therefore the same golden tag) whether all
+// values are separate, all inline, or the two alternate. All golden tags in
+// this section were computed independently with Python's hmac/hashlib/struct
+// straight from the format-1 byte contract in README.md, never derived from
+// this crate's own HMAC output.
+// ---------------------------------------------------------------------------
+
+/// Rich equivalence fixture: the key id and one field each contain '=' (only
+/// the FIRST '=' splits an option name from its inline value), fields carry
+/// leading/trailing spaces, Chinese and a real newline, and an empty field
+/// sits in the middle so reordering/dropping could not pass silently.
+const SPELL_KEY: &str = "00112233445566778899aabbccddeeff";
+const SPELL_KID: &str = " kid=名 ";
+const SPELL_VERSION: &str = "42";
+const SPELL_FIELDS: &[&str] = &["世界", " a=b=c ", "line1\nline2", "", "  边缘  "];
+const SPELL_GOLDEN: &str = "5c347800ef565c35745f8c2adc7fb63a1a18bb0ea3c9cd800510c8d4fa08e176";
+
+/// Append `name`/`value` either as two arguments or one `name=value` token.
+fn push_option(out: &mut Vec<String>, name: &str, value: &str, inline: bool) {
+    if inline {
+        out.push(format!("{name}={value}"));
+    } else {
+        out.push(name.to_string());
+        out.push(value.to_string());
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// Every value as the immediately following argument.
+    AllSeparate,
+    /// Every value as `--name=value`.
+    AllInline,
+    /// Both spellings on one command line: the key is inline, the other two
+    /// metadata options are separate, and fields alternate starting with a
+    /// separate value (so the empty field is the inline `--field=`).
+    Mixed,
+}
+
+/// Build the `sign` argument vector (without the leading "sign") for the
+/// fixture under one spelling.
+fn fixture_argv(style: Spelling) -> Vec<String> {
+    let mut args = Vec::new();
+    match style {
+        Spelling::AllSeparate => {
+            push_option(&mut args, "--key", SPELL_KEY, false);
+            push_option(&mut args, "--key-id", SPELL_KID, false);
+            push_option(&mut args, "--key-version", SPELL_VERSION, false);
+            for f in SPELL_FIELDS {
+                push_option(&mut args, "--field", f, false);
+            }
+        }
+        Spelling::AllInline => {
+            push_option(&mut args, "--key", SPELL_KEY, true);
+            push_option(&mut args, "--key-id", SPELL_KID, true);
+            push_option(&mut args, "--key-version", SPELL_VERSION, true);
+            for f in SPELL_FIELDS {
+                push_option(&mut args, "--field", f, true);
+            }
+        }
+        Spelling::Mixed => {
+            push_option(&mut args, "--key", SPELL_KEY, true);
+            push_option(&mut args, "--key-id", SPELL_KID, false);
+            push_option(&mut args, "--key-version", SPELL_VERSION, false);
+            for (i, f) in SPELL_FIELDS.iter().enumerate() {
+                push_option(&mut args, "--field", f, i % 2 == 1);
+            }
+        }
+    }
+    args
+}
+
+/// Run `sign` with raw string arguments and require the success contract,
+/// returning the parsed record and exact stdout bytes.
+fn sign_raw_ok(args: &[&str]) -> (Record, Vec<u8>) {
+    let out = run_sign_raw(args);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "args={args:?}, stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "args={args:?}, stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (parse_single_record(&out.stdout), out.stdout)
+}
+
+#[test]
+fn sign_value_spellings_produce_byte_identical_records() {
+    let mut stdouts = Vec::new();
+    for style in [Spelling::AllSeparate, Spelling::AllInline, Spelling::Mixed] {
+        let argv = fixture_argv(style);
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let (rec, raw) = sign_raw_ok(&args);
+
+        // The authenticated text is character-identical regardless of how the
+        // values were delimited: Chinese, newline, surrounding spaces and the
+        // embedded '=' are all preserved, and the empty field stays in place.
+        assert_eq!(rec.key_id, SPELL_KID);
+        assert_eq!(rec.key_version, SPELL_VERSION.parse::<i64>().unwrap());
+        assert_eq!(
+            rec.fields,
+            SPELL_FIELDS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        // One independently computed golden tag pins the format-1 encoding.
+        assert_eq!(rec.tag, SPELL_GOLDEN);
+
+        // The actual key is used for the MAC only and never appears as a
+        // value anywhere in the record.
+        let mut strings = Vec::new();
+        rec.raw.strings(&mut strings);
+        assert!(
+            strings
+                .iter()
+                .all(|s| !s.eq_ignore_ascii_case(SPELL_KEY)),
+            "raw key material must not be part of the record: {strings:?}"
+        );
+        stdouts.push(raw);
+    }
+
+    // The strongest equivalence claim: the wire record is byte-for-byte the
+    // same under all three spellings.
+    assert_eq!(stdouts[0], stdouts[1], "separate vs inline spelling differ");
+    assert_eq!(stdouts[1], stdouts[2], "inline vs mixed spelling differ");
+}
+
+#[test]
+fn sign_text_and_option_boundaries_are_spelling_independent() {
+    // Each row exercises one boundary rule twice (separate and inline
+    // spelling), which must produce the same record and golden tag:
+    //   - a separate value that literally reads "--key"/"--field" is the
+    //     value, never another option;
+    //   - only the first '=' splits, so later '=' (including a leading value
+    //     of "=x" or the "--key=1" tail) stay inside the value.
+    struct Case {
+        separate: &'static [&'static str],
+        inline: &'static [&'static str],
+        key_id: &'static str,
+        fields: &'static [&'static str],
+        golden: &'static str,
+    }
+    let cases = &[
+        Case {
+            separate: &[
+                "--key", "00ff", "--key-id", "id", "--key-version", "1", "--field", "--key",
+            ],
+            inline: &[
+                "--key=00ff", "--key-id=id", "--key-version=1", "--field=--key",
+            ],
+            key_id: "id",
+            fields: &["--key"],
+            golden: "5ab73f964e87cb21da9944681f0118ce28131b7aef99f7ef1f3aca8c2bc934dd",
+        },
+        Case {
+            separate: &[
+                "--key", "00ff", "--key-id", "id", "--key-version", "1", "--field", "--field",
+            ],
+            inline: &[
+                "--key=00ff", "--key-id=id", "--key-version=1", "--field=--field",
+            ],
+            key_id: "id",
+            fields: &["--field"],
+            golden: "2a1b0786e3219e7ca4f6b5a6f06783d8d9f89f073388ba314bdde80f2af5d0b8",
+        },
+        Case {
+            separate: &["--key", "00ff", "--key-id", "--field", "--key-version", "1"],
+            inline: &["--key=00ff", "--key-id=--field", "--key-version=1"],
+            key_id: "--field",
+            fields: &[],
+            golden: "f49089194dae57d10dd4b2bf5bbb6489354cd260e967a2f716bca3f60f337e81",
+        },
+        Case {
+            separate: &["--key", "00ff", "--key-id", "--key", "--key-version", "1"],
+            inline: &["--key=00ff", "--key-id=--key", "--key-version=1"],
+            key_id: "--key",
+            fields: &[],
+            golden: "a22a50a36d7ba633416786103daf13d300ad13b4439bdf15c1e2d08260281852",
+        },
+        Case {
+            separate: &[
+                "--key", "00ff", "--key-id", "id", "--key-version", "1", "--field", "a=b=c",
+            ],
+            inline: &[
+                "--key=00ff", "--key-id=id", "--key-version=1", "--field=a=b=c",
+            ],
+            key_id: "id",
+            fields: &["a=b=c"],
+            golden: "be789c90ecf9d3981f1d5be9bea6497d2ce8ed92faedb4e6e3e35cb3498f1856",
+        },
+        Case {
+            // The value itself starts with '=': "--field==x" splits once into
+            // name "--field" and value "=x".
+            separate: &[
+                "--key", "00ff", "--key-id", "id", "--key-version", "1", "--field", "=x",
+            ],
+            inline: &[
+                "--key=00ff", "--key-id=id", "--key-version=1", "--field==x",
+            ],
+            key_id: "id",
+            fields: &["=x"],
+            golden: "592344efb7559d8a3d9822ab61a192a925d4652d9bd346f5d980095396c9d007",
+        },
+        Case {
+            // First '=' belongs to the option, the second '=' is key-id text.
+            separate: &[
+                "--key", "00ff", "--key-id", "a=b", "--key-version", "1", "--field", "z",
+            ],
+            inline: &[
+                "--key=00ff", "--key-id=a=b", "--key-version=1", "--field", "z",
+            ],
+            key_id: "a=b",
+            fields: &["z"],
+            golden: "947a9ee5f6c16e36a625bc9d33c34bcbc2658b4111a1c8f2ba6e1b3586dbd410",
+        },
+        Case {
+            // An inline option-looking value keeps everything after the split,
+            // including the trailing "=1".
+            separate: &[
+                "--key", "00ff", "--key-id", "id", "--key-version", "1", "--field", "--key=1",
+            ],
+            inline: &[
+                "--key=00ff", "--key-id=id", "--key-version=1", "--field=--key=1",
+            ],
+            key_id: "id",
+            fields: &["--key=1"],
+            golden: "fe48b0c026b6c54f4df9153f1aae0afedc350f047f1187fc5f94125b3cf8d773",
+        },
+    ];
+
+    for case in cases {
+        let (sep_rec, sep_raw) = sign_raw_ok(case.separate);
+        let (inl_rec, inl_raw) = sign_raw_ok(case.inline);
+        assert_eq!(sep_rec.key_id, case.key_id, "separate spelling key-id");
+        assert_eq!(
+            sep_rec.fields,
+            case.fields.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "separate spelling fields"
+        );
+        assert_eq!(sep_rec.tag, case.golden, "separate spelling golden tag");
+        assert_eq!(inl_rec.key_id, case.key_id, "inline spelling key-id");
+        assert_eq!(
+            inl_rec.fields,
+            case.fields.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "inline spelling fields"
+        );
+        assert_eq!(inl_rec.tag, case.golden, "inline spelling golden tag");
+        // The boundary rules must make the two spellings indistinguishable on
+        // the wire, not merely equivalent after parsing.
+        assert_eq!(sep_raw, inl_raw, "separate and inline records differ");
+    }
+
+    // The immediate-argument rule has an observable ordering consequence: in
+    // `--field --field x` the FIRST --field consumes the literal text
+    // "--field" as its value, leaving `x` as a bare (unrecognized) argument.
+    // A parser that special-cased the "--" prefix would instead treat this as
+    // two options and produce a different, misleading error.
+    let stderr = expect_usage_error(&[
+        "--key", "00ff", "--key-id", "id", "--key-version", "1", "--field", "--field", "x",
+    ]);
+    assert!(
+        stderr.contains("unrecognized"),
+        "the leftover bare argument must be reported: {stderr}"
+    );
+}
+
+#[test]
+fn sign_explicit_empty_field_differs_from_no_field_binding() {
+    // `--field=` is one legal empty field; `--field ""` spells the same
+    // record; omitting --field entirely is the zero-field message. All three
+    // are valid, but the empty-field record authenticates different bytes.
+    let inline_args = ["--key=00ff", "--key-id=id", "--key-version=1", "--field="];
+    let separate_args = [
+        "--key", "00ff", "--key-id", "id", "--key-version", "1", "--field", "",
+    ];
+    let no_field_args = ["--key=00ff", "--key-id=id", "--key-version=1"];
+
+    let (inl, inl_raw) = sign_raw_ok(&inline_args);
+    let (sep, sep_raw) = sign_raw_ok(&separate_args);
+    let (none, _) = sign_raw_ok(&no_field_args);
+
+    assert_eq!(inl.fields, vec![String::new()]);
+    assert_eq!(sep.fields, vec![String::new()]);
+    assert_eq!(inl_raw, sep_raw, "`--field=` and `--field \"\"` must match");
+    assert_eq!(
+        inl.tag,
+        "1403803e197b14216fd9d51ff583dfb5eaba67aab92e0e96ba5f873bbeeee164"
+    );
+    assert_eq!(none.fields, Vec::<String>::new());
+    assert_eq!(
+        none.tag,
+        "264a531e2944beb41202f1c1249f2bc1b838f176469a68cdffc484f7ee29b3d6"
+    );
+    assert_ne!(inl.tag, none.tag, "empty field is not the zero-field message");
+}
+
+#[test]
+fn sign_fields_stay_repeatable_when_spellings_mix() {
+    // Duplicate field content is kept twice and order is preserved even when
+    // the repeated --field options alternate between the two spellings.
+    let args = [
+        "--key", "00ff", "--key-id", "id", "--key-version", "1",
+        "--field", "x", "--field=x", "--field", "y",
+    ];
+    let (rec, _) = sign_raw_ok(&args);
+    assert_eq!(rec.fields, vec!["x".to_string(), "x".to_string(), "y".to_string()]);
+    assert_eq!(
+        rec.tag,
+        "47d0d033362b28a7f66de34307032abb9a380dffca190c11e5a35aaa203641c6"
+    );
+}
+
+#[test]
+fn sign_single_use_options_duplicated_across_spellings_fail() {
+    // A second occurrence is a duplicate no matter which spelling each copy
+    // uses or which comes first; neither the first nor the last value may be
+    // adopted. Every case must exit 2 with empty stdout and a message that
+    // names the known option and calls out the duplication.
+    let cases: &[(&str, &[&str])] = &[
+        // --key: identical values and both orders.
+        (
+            "--key",
+            &["--key", "00ff", "--key=00ff", "--key-id", "id", "--key-version", "1"],
+        ),
+        (
+            "--key",
+            &["--key=00ff", "--key", "00ff", "--key-id", "id", "--key-version", "1"],
+        ),
+        // --key-id: distinct values and both orders.
+        (
+            "--key-id",
+            &["--key", "00ff", "--key-id", "id", "--key-id=x", "--key-version", "1"],
+        ),
+        (
+            "--key-id",
+            &["--key", "00ff", "--key-id=id", "--key-id", "id", "--key-version", "1"],
+        ),
+        // --key-version: distinct values and both orders.
+        (
+            "--key-version",
+            &["--key", "00ff", "--key-id", "id", "--key-version", "1", "--key-version=2"],
+        ),
+        (
+            "--key-version",
+            &["--key", "00ff", "--key-id", "id", "--key-version=1", "--key-version", "2"],
+        ),
+    ];
+    for (option, args) in cases {
+        let stderr = expect_usage_error(args);
+        assert!(
+            stderr.contains(option),
+            "message must name the known option {option}: {stderr}"
+        );
+        assert!(
+            stderr.contains("exactly once"),
+            "message must describe the duplication: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn sign_explicit_empty_value_is_invalid_not_missing() {
+    // An inline empty value is a value that is present but illegal: the
+    // message must be a value error, never "requires a value".
+    let stderr = expect_usage_error(&["--key=", "--key-id", "id", "--key-version", "1"]);
+    assert!(stderr.contains("--key"), "{stderr}");
+    assert!(stderr.contains("hexadecimal"), "must reject the empty key value: {stderr}");
+    assert!(!stderr.contains("requires a value"), "empty value is a present value: {stderr}");
+
+    let stderr = expect_usage_error(&["--key", "", "--key-id", "id", "--key-version", "1"]);
+    assert!(stderr.contains("--key"), "{stderr}");
+    assert!(stderr.contains("hexadecimal"), "separate empty key is invalid too: {stderr}");
+
+    let stderr = expect_usage_error(&["--key", "00ff", "--key-id=", "--key-version", "1"]);
+    assert!(stderr.contains("--key-id"), "{stderr}");
+    assert!(stderr.contains("empty"), "must reject the empty key id: {stderr}");
+    assert!(!stderr.contains("requires a value"), "empty value is a present value: {stderr}");
+
+    // Contrast with a genuinely absent following value: that is a different
+    // failure and must keep its "requires a value" wording.
+    let stderr = expect_usage_error(&["--key", "00ff", "--key-id", "id", "--key-version"]);
+    assert!(stderr.contains("--key-version"), "{stderr}");
+    assert!(stderr.contains("requires a value"), "missing value must be reported as such: {stderr}");
+
+    let stderr = expect_usage_error(&[
+        "--key", "00ff", "--key-id", "id", "--key-version", "1", "--field",
+    ]);
+    assert!(stderr.contains("--field"), "{stderr}");
+    assert!(stderr.contains("requires a value"), "missing field value must be reported: {stderr}");
+}
+
+#[test]
+fn sign_spelling_errors_never_echo_values() {
+    let secret = "deadbeefcafebabedeadbeefcafebabe";
+
+    // Cross-spelling duplicate where the first (valid, secret) key and the
+    // second key differ: it is still a duplicate, and neither value leaks.
+    let argv = vec![
+        "--key".to_string(), secret.to_string(),
+        "--key=00ff".to_string(),
+        "--key-id".to_string(), "id".to_string(),
+        "--key-version".to_string(), "1".to_string(),
+    ];
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let stderr = expect_usage_error(&args);
+    assert!(!stderr.contains(secret), "stderr echoed the key: {stderr}");
+    assert!(!stderr.contains("00ff"), "stderr echoed the rejected value: {stderr}");
+
+    // Same with the secret carried by the inline copy.
+    let argv = vec![
+        format!("--key={secret}"),
+        "--key".to_string(), "00ff".to_string(),
+        "--key-id".to_string(), "id".to_string(),
+        "--key-version".to_string(), "1".to_string(),
+    ];
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let stderr = expect_usage_error(&args);
+    assert!(!stderr.contains(secret), "stderr echoed the key: {stderr}");
+
+    // An invalid inline key value is rejected by content but never quoted.
+    let argv = vec![
+        "--key=abczz".to_string(),
+        "--key-id".to_string(), "id".to_string(),
+        "--key-version".to_string(), "1".to_string(),
+    ];
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let stderr = expect_usage_error(&args);
+    assert!(!stderr.contains("abczz"), "stderr echoed the rejected key: {stderr}");
+}
+
+// ---------------------------------------------------------------------------
 // Failure-path tests.
 // ---------------------------------------------------------------------------
 
