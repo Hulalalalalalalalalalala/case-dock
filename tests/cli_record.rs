@@ -346,6 +346,209 @@ fn verify_rejects_corrupt_and_ill_typed_records() {
     expect_verify_invalid(b"\xff\xff", &["--key", key]);
 }
 
+// ---------------------------------------------------------------------------
+// verify: key_version regression coverage
+//
+// The key version participates in the authenticated content AND is constrained
+// by the record grammar, so callers must be able to tell apart:
+//   * a structurally legal record whose tag does not match (exit 1), and
+//   * a record whose key_version spelling or range is illegal (exit 2).
+// Every tag below is an independent Python golden over the format-1 contract
+// in README.md (key 00ff, key_id "kidprobe", one field "verprobe"); `sign` is
+// not used to produce the boundary/mismatch records, so a shared sign/verify
+// bug cannot make these pass.
+// ---------------------------------------------------------------------------
+
+const KV_KEY: &str = "00ff";
+/// A different but well-formed key: choosing the wrong key must turn a
+/// structurally legal record into a mismatch, never into corrupt input.
+const KV_WRONG_KEY: &str = "0102";
+const KV_KID: &str = "kidprobe";
+const KV_FIELD: &str = "verprobe";
+/// Golden tag at version 1 (the range's low endpoint).
+const KV_TAG_V1: &str = "4301ff56f516eef690d78758c6fd0311d90391920d1b4a5eddd0cdc2966e4a53";
+/// Golden tag at version 4294967295 (the range's high endpoint, u32::MAX).
+const KV_TAG_VMAX: &str = "5760ad7d9bfc942d2754bce443165a5db296460b9401a4dea878137d9b960e64";
+/// Golden tag at version 7 (what `sign --key-version 007` must authenticate).
+const KV_TAG_V7: &str = "deabcb0017a1462e2d59490a499830033877d4b13450f8a502e5cea18e4dc798";
+
+/// Hand-author a record with an arbitrary *raw* `key_version` token (which may
+/// be illegal JSON) and an arbitrary tag.
+fn kv_record(version_token: &str, tag: &str) -> String {
+    format!(
+        r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"{KV_KID}","key_version":{version_token},"fields":["{KV_FIELD}"],"tag":"{tag}"}}"#
+    )
+}
+
+#[test]
+fn verify_key_version_range_endpoints_are_normal_versions() {
+    // Both endpoints of 1..=4294967295 are ordinary usable versions: with the
+    // correct key the record verifies (exit 0, exactly one {"valid":true}
+    // line, empty stderr). The key version is independent of the record's
+    // format version: a key version other than 1 must never be reported as an
+    // unsupported format.
+    for (token, golden) in [("1", KV_TAG_V1), ("4294967295", KV_TAG_VMAX)] {
+        let rec = kv_record(token, golden);
+
+        let out = run_verify(KV_KEY, rec.as_bytes());
+        assert_eq!(out.status.code(), Some(0), "version {token}: stderr={:?}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, b"{\"valid\":true}\n");
+        assert!(out.stderr.is_empty(), "version {token}: stderr must be empty");
+
+        // The same structurally legal record under a wrong key is a mismatch,
+        // not a format/structure rejection.
+        let out = run_verify(KV_WRONG_KEY, rec.as_bytes());
+        assert_eq!(out.status.code(), Some(1), "version {token}: wrong key must mismatch");
+        assert_eq!(out.stdout, b"{\"valid\":false}\n");
+        assert!(out.stderr.is_empty());
+    }
+}
+
+#[test]
+fn verify_changing_an_in_range_key_version_is_a_mismatch_not_corruption() {
+    // Everything else (including the original tag) stays fixed; only the
+    // version moves to another in-range integer. The record stays legal but
+    // the authenticated content changed, so the result is exit 1 with BOTH the
+    // correct key and a wrong key: a wrong key must not reclassify the legal
+    // version number as corrupt input.
+    let variants = [
+        kv_record("2", KV_TAG_V1),                 // 1 -> 2
+        kv_record("4294967295", KV_TAG_V1),        // 1 -> high endpoint
+        kv_record("1", KV_TAG_VMAX),               // max -> 1 with max's tag
+        // Legal JSON whitespace around members and around the number must not
+        // change the version's meaning: still a structural legal mismatch.
+        format!(
+            r#"{{ "format" : 1 , "algorithm" : "HMAC-SHA256" , "key_id" : "{KV_KID}" , "key_version" : 2 , "fields" : [ "{KV_FIELD}" ] , "tag" : "{KV_TAG_V1}" }}"#
+        ),
+    ];
+    for rec in variants {
+        for key in [KV_KEY, KV_WRONG_KEY] {
+            let out = run_verify(key, rec.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "expected mismatch for {rec}, stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"{\"valid\":false}\n");
+            assert!(out.stderr.is_empty(), "mismatch must be silent on stderr");
+        }
+    }
+}
+
+#[test]
+fn verify_illegal_key_version_spellings_are_corrupt_input() {
+    // None of these may be accepted as integer 7 (or any other integer):
+    // quoted text, fraction, exponent, leading zero are not JSON integers;
+    // zero/negative/above-max are out of range; the huge decimal is far beyond
+    // integer parse range and must not truncate, round or wrap to a valid
+    // version. Every one is exit 2: empty stdout and a stderr that explains
+    // the number/version problem without echoing the key, record text or the
+    // rejected literal. The outcome is identical when a valid-but-wrong key is
+    // supplied: structural invalidity takes precedence over authentication.
+    let cases: &[&str] = &[
+        r#""7""#,                                  // string, not a number
+        "7.0",                                     // fraction spelling of 7
+        "7e0",                                     // exponent spelling of 7
+        "007",                                     // leading zero
+        "0",                                       // below range
+        "-0",                                      // parses numerically to 0: still below range
+        "-1",                                      // negative
+        "4294967296",                              // one above the max
+        "99999999999999999999999999999999999999999", // far beyond i128 parsing
+    ];
+    for token in cases {
+        for key in [KV_KEY, KV_WRONG_KEY] {
+            let out = run_verify(key, kv_record(token, KV_TAG_V1).as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "token {token:?}: expected corrupt input (exit 2), key={key}"
+            );
+            assert!(out.stdout.is_empty(), "token {token:?}: stdout must be empty");
+            let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+            assert!(
+                !stderr.trim().is_empty(),
+                "token {token:?}: stderr must explain the problem"
+            );
+            let lower = stderr.to_lowercase();
+            assert!(
+                lower.contains("number") || lower.contains("integer") || lower.contains("version"),
+                "token {token:?}: stderr must describe the number/version problem: {stderr}"
+            );
+            // Never echo the key, any record text, or the full record.
+            assert!(!stderr.contains(key), "token {token:?}: stderr echoed the key: {stderr}");
+            assert!(!stderr.contains(KV_KID), "token {token:?}: stderr echoed key id: {stderr}");
+            assert!(!stderr.contains(KV_FIELD), "token {token:?}: stderr echoed a field: {stderr}");
+            assert!(!stderr.contains(KV_TAG_V1), "token {token:?}: stderr echoed the tag/record: {stderr}");
+
+            // The same record padded with legal JSON whitespace stays corrupt:
+            // whitespace cannot launder a bad number spelling.
+            let padded = format!(" \n\t{}\r\n  ", kv_record(token, KV_TAG_V1));
+            let out = run_verify(key, padded.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "token {token:?}: padding must not make it accepted, key={key}"
+            );
+            assert!(out.stdout.is_empty());
+        }
+    }
+
+    // The rejected literal itself must not be quoted back (checked for the
+    // distinctive spellings whose digits do not legitimately appear in the
+    // fixed "1..=4294967295" range text).
+    for token in &[r#""7""#, "7.0", "7e0", "007", "4294967296",
+                   "99999999999999999999999999999999999999999"] {
+        for key in [KV_KEY, KV_WRONG_KEY] {
+            let out = run_verify(key, kv_record(token, KV_TAG_V1).as_bytes());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !stderr.contains(token),
+                "token {token:?}: stderr echoed the rejected literal: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sign_key_version_007_canonicalizes_but_record_007_is_corrupt() {
+    // The command line and the record grammar differ on purpose: sign's
+    // --key-version is decimal command-line text, so "007" means integer 7;
+    // the emitted record must carry the canonical integer spelling 7 and then
+    // verify normally.
+    let out = run_sign(KV_KEY, KV_KID, "007", &[KV_FIELD]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let signed = String::from_utf8(out.stdout).unwrap();
+    assert!(signed.contains("\"key_version\":7"), "record must carry integer 7: {signed}");
+    assert!(!signed.contains("\"key_version\":007"), "record must not carry 007: {signed}");
+    let rec = parse_single_record(signed.as_bytes());
+    assert_eq!(rec.key_version, 7);
+    assert_eq!(rec.tag, KV_TAG_V7, "007 must authenticate as integer 7");
+
+    // The produced record verifies as-is, and again when surrounded only by
+    // legal JSON whitespace.
+    let body = signed.trim_end_matches('\n');
+    for input in [signed.as_bytes().to_vec(), format!(" \t\n{body}  \r\n").into_bytes()] {
+        let out = run_verify(KV_KEY, &input);
+        assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, b"{\"valid\":true}\n");
+        assert!(out.stderr.is_empty());
+    }
+
+    // Rewriting the number INSIDE the record to 007 crosses the grammar line:
+    // leading zeros are corrupt JSON, exit 2 (not a mismatch and not integer 7).
+    let tampered = body.replace("\"key_version\":7", "\"key_version\":007");
+    assert_ne!(tampered, body);
+    let out = run_verify(KV_KEY, tampered.as_bytes());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(KV_KEY), "stderr echoed the key: {stderr}");
+    assert!(!stderr.contains(KV_FIELD), "stderr echoed a field: {stderr}");
+}
+
 #[test]
 fn verify_reports_unsupported_format_and_algorithm_explicitly() {
     let key = "00ff";

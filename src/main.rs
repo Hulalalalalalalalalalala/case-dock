@@ -1112,6 +1112,92 @@ mod tests {
     }
 
     #[test]
+    fn verify_key_version_boundaries_tamper_and_illegal_spellings() {
+        let key = "00ff";
+        let wrong_key = "0102";
+
+        // Both range endpoints are ordinary versions: a key version other
+        // than 1 is distinct from the (also 1) record format version and must
+        // never surface as an unsupported format.
+        for version in [1u32, 4294967295] {
+            let rec = record_for(key, "id", version, &["x"]);
+            assert!(
+                matches!(verify_input(rec.as_bytes(), key), VerifyOutcome::Valid),
+                "version {version} must verify with the correct key"
+            );
+            assert!(
+                matches!(verify_input(rec.as_bytes(), wrong_key), VerifyOutcome::Mismatch),
+                "version {version} under a wrong key is a mismatch"
+            );
+        }
+
+        // Another in-range integer with the original tag is a legal record but
+        // different authenticated content: mismatch under either key, never a
+        // structural error.
+        let v1 = record_for(key, "id", 1, &["x"]);
+        let vmax_tag = sign_tag(key, "id", 4294967295, &["x"]);
+        let tampered = [
+            v1.replace("\"key_version\":1", "\"key_version\":2"),
+            v1.replace("\"key_version\":1", "\"key_version\":4294967295"),
+            record_for(key, "id", 4294967295, &["x"])
+                .replace(&vmax_tag, &sign_tag(key, "id", 1, &["x"])),
+        ];
+        for rec in tampered {
+            for k in [key, wrong_key] {
+                assert!(
+                    matches!(verify_input(rec.as_bytes(), k), VerifyOutcome::Mismatch),
+                    "expected mismatch for {rec}"
+                );
+            }
+        }
+
+        // Illegal spellings/ranges are corrupt input regardless of the key;
+        // none is accepted as integer 7 or wrapped/truncated into range.
+        let zeros = "a".repeat(64);
+        let raw_record = |token: &str| {
+            format!(
+                "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\
+                 \"key_version\":{token},\"fields\":[\"x\"],\"tag\":\"{zeros}\"}}"
+            )
+        };
+        let illegal = [
+            "\"7\"",
+            "7.0",
+            "7e0",
+            "007",
+            "0",
+            "-0",
+            "-1",
+            "4294967296",
+            "99999999999999999999999999999999999999999",
+        ];
+        for token in illegal {
+            for k in [key, wrong_key] {
+                match verify_input(raw_record(token).as_bytes(), k) {
+                    VerifyOutcome::Invalid(msg) => {
+                        let lower = msg.to_lowercase();
+                        assert!(
+                            lower.contains("number")
+                                || lower.contains("integer")
+                                || lower.contains("version"),
+                            "token {token}: message must describe the number/version problem: {msg}"
+                        );
+                    }
+                    other => panic!("token {token}: expected Invalid, got {other:?}"),
+                }
+            }
+        }
+
+        // Legal JSON whitespace around members leaves the version's meaning
+        // intact (a tampered in-range version is still just a mismatch).
+        let spaced = v1.replace("\"key_version\":1", "\"key_version\" : 2 ");
+        assert!(matches!(
+            verify_input(spaced.as_bytes(), key),
+            VerifyOutcome::Mismatch
+        ));
+    }
+
+    #[test]
     fn verify_unsupported_format_and_algorithm_are_explicit() {
         let key = "00ff";
         let tag = "a".repeat(64);
