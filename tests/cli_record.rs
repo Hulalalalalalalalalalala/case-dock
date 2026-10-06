@@ -2462,3 +2462,198 @@ fn verify_lookalike_member_names_are_never_recognized() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Long keys: at and beyond the 64-byte SHA-256 HMAC block.
+//
+// A user-supplied key is any non-empty, even-length hex string; keys whose
+// decoded length exceeds one SHA-256 block (64 bytes) must NOT be rejected or
+// truncated — standard HMAC hashes such keys first (RFC 2104 / RFC 4231).
+// Every golden tag below was computed independently with Python's
+// hmac/hashlib/struct straight from the format-1 byte contract in README.md
+// (and cross-checked with openssl), never derived from this crate's own HMAC
+// code, so a shared sign/verify bug cannot make these tests pass.
+//
+// All cases sign the SAME content: key_id "demo", key_version 3, fields
+// ["hello", "世界"] — only the key length moves.
+// ---------------------------------------------------------------------------
+
+/// Hex string of the byte sequence 0x00, 0x01, ..., n-1 (n bytes, wrapping at
+/// 256). The leading 0x00 byte is deliberate: 00 is ordinary key material.
+fn seq_key(n: usize) -> String {
+    (0..n).map(|b| format!("{:02x}", b % 256)).collect()
+}
+
+/// Golden tag for the 63-byte key 0x00..0x3e (just under one block).
+const LK_TAG_63: &str = "089231f361f5a0bbd1c3ae127f54d1a093e5675a0f53bcc5131e7e9bfa24eb8d";
+/// Golden tag for the 64-byte key 0x00..0x3f (exactly one block).
+const LK_TAG_64: &str = "e7f6422afb29d605ce331e2853578940225a9bb9797bed580e16f943fbb8f419";
+/// Golden tag for the 65-byte key 0x00..0x40 (one byte past the block).
+const LK_TAG_65: &str = "037c2e5d646e2522ba2eeb684776751feb39218c3729005d0f89ca3668ad884a";
+/// Golden tag for the 131-byte key 0xaa*131 (the RFC 4231 test case 6 key,
+/// clearly longer than one block).
+const LK_TAG_131: &str = "4686e39e11e98e975b77659dcd4ae707c049d4d29263083969e112f913198455";
+
+/// The four long keys together with their independent golden tags.
+fn long_key_cases() -> Vec<(String, &'static str)> {
+    vec![
+        (seq_key(63), LK_TAG_63),
+        (seq_key(64), LK_TAG_64),
+        (seq_key(65), LK_TAG_65),
+        ("aa".repeat(131), LK_TAG_131),
+    ]
+}
+
+#[test]
+fn sign_keys_around_and_beyond_the_hmac_block_match_golden_tags() {
+    let fields = ["hello", "世界"];
+    let mut tags = std::collections::HashSet::new();
+    for (key, golden) in long_key_cases() {
+        let label = format!("key-{}bytes", key.len() / 2);
+        // expect_signed_record pins: exit 0, empty stderr, exactly one JSON
+        // line, the six members in order, the original fields/key-id/version,
+        // a 64-character lowercase hex tag, and no key material in the record.
+        let rec = expect_signed_record(&label, &key, "demo", "3", &fields, golden);
+        assert!(
+            tags.insert(rec.tag),
+            "keys of different lengths must not collapse to one tag"
+        );
+    }
+
+    // Hex letter case is not key material: the uppercase spelling of the
+    // 65-byte key is the same key and must produce the same record.
+    let upper = seq_key(65).to_uppercase();
+    expect_signed_record("key-65bytes-uppercase", &upper, "demo", "3", &fields, LK_TAG_65);
+}
+
+#[test]
+fn verify_long_key_records_round_trip_and_external_records_verify() {
+    let fields = ["hello", "世界"];
+
+    // A record signed by this tool with a long key verifies with the same key:
+    // exit 0, exactly {"valid":true}, empty stderr.
+    for (key, _) in long_key_cases() {
+        let record = sign_record_bytes(&key, "demo", "3", &fields);
+        let out = run_verify(&key, &record);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "key of {} bytes: stderr={:?}",
+            key.len() / 2,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n");
+        assert!(out.stderr.is_empty());
+    }
+
+    // A record produced OUTSIDE this tool, carrying the independent golden
+    // tag for the 131-byte key, verifies just the same: compatibility is
+    // anchored to the published format-1 contract, not to self-consistency.
+    let key131 = "aa".repeat(131);
+    let external = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"demo\",\"key_version\":3,\"fields\":[\"hello\",\"世界\"],\"tag\":\"{LK_TAG_131}\"}}"
+    );
+    let out = run_verify(&key131, external.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // The same external record re-formatted (members reordered, JSON
+    // whitespace padding) still verifies under the long key.
+    let pretty = format!(
+        "  {{\n    \"tag\" : \"{LK_TAG_131}\",\n    \"fields\" : [ \"hello\" , \"世界\" ],\n    \"key_version\" : 3,\n    \"key_id\" : \"demo\",\n    \"algorithm\" : \"HMAC-SHA256\",\n    \"format\" : 1\n  }}\r\n"
+    );
+    let out = run_verify(&key131, pretty.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_long_key_tail_bytes_and_truncation_are_mismatch_not_corruption() {
+    let key131 = "aa".repeat(131);
+    let record = sign_record_bytes(&key131, "demo", "3", &["hello", "世界"]);
+
+    // Every key below is well-formed hex, so the record stays structurally
+    // legal: the outcome must be a plain mismatch (exit 1, {"valid":false},
+    // empty stderr), never a corrupt-input exit 2.
+    let wrong_keys = [
+        // Same first 64 bytes, different content beyond the block boundary:
+        // the tail of a long key is key material, not padding to ignore.
+        format!("{}{}", "aa".repeat(64), "bb".repeat(67)),
+        // The key truncated to exactly one 64-byte block is a DIFFERENT key.
+        "aa".repeat(64),
+        // A single byte flipped inside the first block.
+        format!("ab{}", "aa".repeat(130)),
+    ];
+    for key in wrong_keys {
+        let out = run_verify(&key, &record);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "key must mismatch, not error: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":false}\n");
+        assert!(out.stderr.is_empty(), "mismatch must be silent on stderr");
+    }
+
+    // The 65th byte must not be dropped: a record signed with the 65-byte key
+    // must not verify under its 64-byte truncation, and the 64-byte key's
+    // record must not verify under the 65-byte key.
+    let rec65 = sign_record_bytes(&seq_key(65), "demo", "3", &["hello", "世界"]);
+    let rec64 = sign_record_bytes(&seq_key(64), "demo", "3", &["hello", "世界"]);
+    for (record, key) in [(&rec65, seq_key(64)), (&rec64, seq_key(65))] {
+        let out = run_verify(&key, record);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "truncating/extending the key must mismatch: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":false}\n");
+        assert!(out.stderr.is_empty());
+    }
+}
+
+#[test]
+fn long_keys_still_must_be_well_formed_hex() {
+    // Length never relaxes the input rules: a long key with a non-hex
+    // character (here deep in the tail, past byte 64) or with an odd number
+    // of digits is still a usage error — exit 2, empty stdout, and a stderr
+    // that names --key and the hex problem without echoing the key.
+    let long = seq_key(131); // distinctive content: 000102...7f808182...
+    let mut nonhex = long.clone();
+    nonhex.replace_range(200..201, "g");
+    let odd = &long[..long.len() - 1];
+
+    for bad in [&nonhex, odd] {
+        let stderr = expect_usage_error(&["--key", bad, "--key-id", "id", "--key-version", "1"]);
+        assert!(stderr.contains("--key"), "stderr must name --key: {stderr}");
+        assert!(
+            stderr.contains("hexadecimal"),
+            "stderr must describe the key format problem: {stderr}"
+        );
+        assert!(!stderr.contains(bad), "stderr echoed the rejected key: {stderr}");
+        assert!(
+            !stderr.contains(&long[..32]),
+            "stderr echoed a fragment of the key: {stderr}"
+        );
+    }
+
+    // verify applies the same key validation before it ever looks at stdin.
+    let record = sign_record_bytes(&seq_key(65), "id", "1", &["x"]);
+    for bad in [&nonhex, odd] {
+        let stderr = expect_verify_invalid(&record, &["--key", bad]);
+        assert!(stderr.contains("--key"), "stderr must name --key: {stderr}");
+        assert!(
+            stderr.contains("hexadecimal"),
+            "stderr must describe the key format problem: {stderr}"
+        );
+        assert!(!stderr.contains(bad), "stderr echoed the rejected key: {stderr}");
+        assert!(
+            !stderr.contains(&long[..32]),
+            "stderr echoed a fragment of the key: {stderr}"
+        );
+    }
+}

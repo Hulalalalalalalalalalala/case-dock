@@ -945,6 +945,20 @@ mod tests {
     }
 
     #[test]
+    // RFC 4231 test case 6: HMAC-SHA256 with a 131-byte key (longer than the
+    // 64-byte SHA-256 block, so the key itself is hashed first), data
+    // "Test Using Larger Than Block-Size Key - Hash Key First".
+    fn hmac_long_key_matches_rfc4231() {
+        let key = vec![0xaau8; 131];
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key).unwrap();
+        mac.update(b"Test Using Larger Than Block-Size Key - Hash Key First");
+        assert_eq!(
+            hex_encode(&mac.finalize().into_bytes()),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
     fn field_boundaries_are_unambiguous() {
         assert_ne!(sign_tag("00ff", "id", 1, &["ab", "c"]), sign_tag("00ff", "id", 1, &["a", "bc"]));
         assert_ne!(sign_tag("00ff", "id", 1, &[]), sign_tag("00ff", "id", 1, &[""]));
