@@ -1397,6 +1397,92 @@ mod tests {
     }
 
     #[test]
+    fn verify_algorithm_name_is_matched_on_decoded_text() {
+        let key = "00ff";
+        let wrong_key = "0102";
+        // A record whose tag genuinely matches under HMAC-SHA256, so the
+        // algorithm member is the only thing that can change the outcome.
+        let tag = sign_tag(key, "algprobe", 1, &["algfield"]);
+        let record = |algorithm_token: &str| {
+            format!(
+                "{{\"format\":1,\"algorithm\":{algorithm_token},\"key_id\":\"algprobe\",\
+                 \"key_version\":1,\"fields\":[\"algfield\"],\"tag\":\"{tag}\"}}"
+            )
+        };
+
+        // The direct spelling and every legal \u-escape spelling that decodes
+        // to "HMAC-SHA256" are the same name and must give the same result.
+        let supported = [
+            "\"HMAC-SHA256\"",
+            "\"HMAC-SHA25\\u0036\"",
+            "\"HMAC\\u002dSHA256\"",
+            "\"\\u0048MAC-SHA256\"",
+            "\"\\u0048\\u004d\\u0041\\u0043\\u002d\\u0053\\u0048\\u0041\\u0032\\u0035\\u0036\"",
+        ];
+        for spelling in supported {
+            assert!(
+                matches!(verify_input(record(spelling).as_bytes(), key), VerifyOutcome::Valid),
+                "spelling {spelling}: equivalent escape spellings must verify"
+            );
+            assert!(
+                matches!(verify_input(record(spelling).as_bytes(), wrong_key), VerifyOutcome::Mismatch),
+                "spelling {spelling}: a wrong key stays a mismatch"
+            );
+        }
+
+        // Any other decoded string is an unsupported algorithm — even though
+        // the record's tag recomputes cleanly under the current algorithm,
+        // and even when the wrong name is written with JSON escapes. The
+        // conclusion must never become Valid or Mismatch.
+        let unsupported = [
+            "\"hmac-sha256\"",       // case differs
+            "\"HMAC-SHA256 \"",      // trailing whitespace
+            "\" HMAC-SHA256\"",      // leading whitespace
+            "\"\"",                  // empty string
+            "\"HMAC-SHA512\"",       // another algorithm
+            "\"HMAC-SHA51\\u0032\"", // escaped spelling of "HMAC-SHA512"
+            "\"hmac-sha25\\u0036\"", // escaped spelling of "hmac-sha256"
+        ];
+        for spelling in unsupported {
+            for k in [key, wrong_key] {
+                match verify_input(record(spelling).as_bytes(), k) {
+                    VerifyOutcome::Invalid(msg) => {
+                        assert!(msg.contains("unsupported"), "{spelling}: {msg}");
+                        assert!(
+                            msg.contains("HMAC-SHA256"),
+                            "{spelling}: must state the only supported algorithm: {msg}"
+                        );
+                    }
+                    other => panic!("{spelling}: expected Invalid, got {other:?}"),
+                }
+            }
+        }
+
+        // Missing and non-string algorithm members keep their own corruption
+        // reasons; neither is folded into the unknown-algorithm wording.
+        let missing = format!(
+            "{{\"format\":1,\"key_id\":\"algprobe\",\"key_version\":1,\
+             \"fields\":[\"algfield\"],\"tag\":\"{tag}\"}}"
+        );
+        match verify_input(missing.as_bytes(), key) {
+            VerifyOutcome::Invalid(msg) => {
+                assert!(msg.contains("missing required member \"algorithm\""), "got: {msg}");
+                assert!(!msg.to_lowercase().contains("unsupported"), "got: {msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        for token in ["1", "true", "null", "[]", "{}"] {
+            match verify_input(record(token).as_bytes(), key) {
+                VerifyOutcome::Invalid(msg) => {
+                    assert!(msg.contains("member \"algorithm\" must be a string"), "{token}: {msg}");
+                    assert!(!msg.to_lowercase().contains("unsupported"), "{token}: {msg}");
+                }
+                other => panic!("token {token}: expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn verify_any_legal_integer_format_other_than_1_is_unsupported_version() {
         // Every spelling below is a legal JSON decimal integer and all other
         // members satisfy the record grammar. The conclusion must be the same
