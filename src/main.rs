@@ -21,12 +21,27 @@ mod auth {
     pub const FORMAT_VERSION: u32 = 1;
     /// Algorithm name written by `sign` and required by `verify`.
     pub const ALGORITHM: &str = "HMAC-SHA256";
+    /// Smallest legal key version; the endpoint itself is a valid version.
+    pub const KEY_VERSION_MIN: u32 = 1;
+    /// Largest legal key version (`u32::MAX`); the endpoint itself is valid.
+    pub const KEY_VERSION_MAX: u32 = 4_294_967_295;
     /// Domain separator that also records the format version, so tags computed
     /// by different versions of the encoding can never collide.
     const DOMAIN_SEPARATOR: &[u8] = b"authnote-sign-v1";
 
     /// One computed authentication tag: a full HMAC-SHA256 output.
     pub type Tag = [u8; 32];
+
+    /// Key-version business rule shared by record generation and record
+    /// validation: a key version is an integer in
+    /// `KEY_VERSION_MIN..=KEY_VERSION_MAX`. This is the single place that
+    /// defines that window, so `sign`'s command-line text and `verify`'s JSON
+    /// number can never enforce different ranges. Each entry point keeps its
+    /// own input grammar (decimal command-line text vs. a strict JSON integer)
+    /// and arrives here only with a value it has already decoded.
+    pub fn is_supported_key_version(version: u32) -> bool {
+        (KEY_VERSION_MIN..=KEY_VERSION_MAX).contains(&version)
+    }
 
     /// Shared key validation for `sign` and `verify`: non-empty even-length
     /// hex. The rejected value is never included in the message.
@@ -265,9 +280,12 @@ fn sign(args: &[String]) -> ExitCode {
     match parse_sign_args(args).and_then(validate_sign_args) {
         Ok(opts) => {
             let key_bytes = auth::decode_key(&opts.key);
-            let key_version: u32 = opts.key_version.parse().expect("version was validated");
-            let tag = auth::compute_tag(&key_bytes, &opts.key_id, key_version, &opts.fields);
-            println!("{}", render_record(&opts.key_id, key_version, &opts.fields, &tag));
+            let tag =
+                auth::compute_tag(&key_bytes, &opts.key_id, opts.key_version, &opts.fields);
+            println!(
+                "{}",
+                render_record(&opts.key_id, opts.key_version, &opts.fields, &tag)
+            );
             ExitCode::SUCCESS
         }
         Err(msg) => {
@@ -299,7 +317,20 @@ fn render_record(key_id: &str, key_version: u32, fields: &[String], tag: &auth::
     )
 }
 
+/// sign's validated options: the version has already been decoded from its
+/// command-line spelling through the shared key-version rule, so "007" and
+/// "7" yield the same integer and the record never sees the raw text.
 struct SignOptions {
+    key: String,
+    key_id: String,
+    key_version: u32,
+    fields: Vec<String>,
+}
+
+/// sign's options immediately after grammar parsing: every option value is
+/// still raw text. Semantic validation (hex key, non-empty id, and the
+/// decimal-to-integer key-version conversion) happens in `validate_sign_args`.
+struct RawSignOptions {
     key: String,
     key_id: String,
     key_version: String,
@@ -330,7 +361,11 @@ const SIGN_KEY_INDEX: usize = 0;
 const SIGN_KEY_ID_INDEX: usize = 1;
 const SIGN_KEY_VERSION_INDEX: usize = 2;
 
-fn parse_sign_args(args: &[String]) -> Result<SignOptions, String> {
+/// Grammar only: collect sign's option values as raw text in order of
+/// appearance. No hex, range or integer checks happen here, so a missing
+/// option and an invalid value are reported by the same path the existing
+/// option-grammar precedence relies on.
+fn parse_sign_args(args: &[String]) -> Result<RawSignOptions, String> {
     let mut key: Option<String> = None;
     let mut key_id: Option<String> = None;
     let mut key_version: Option<String> = None;
@@ -350,7 +385,7 @@ fn parse_sign_args(args: &[String]) -> Result<SignOptions, String> {
     let key = key.ok_or("missing required option --key")?;
     let key_id = key_id.ok_or("missing required option --key-id")?;
     let key_version = key_version.ok_or("missing required option --key-version")?;
-    Ok(SignOptions {
+    Ok(RawSignOptions {
         key,
         key_id,
         key_version,
@@ -358,22 +393,49 @@ fn parse_sign_args(args: &[String]) -> Result<SignOptions, String> {
     })
 }
 
-fn validate_sign_args(opts: SignOptions) -> Result<SignOptions, String> {
+/// Semantic validation: key hex, non-empty key id, and conversion of the
+/// version text into the shared key-version rule. Rejected values are never
+/// echoed.
+fn validate_sign_args(opts: RawSignOptions) -> Result<SignOptions, String> {
     // Never echo the key back in error messages.
     auth::validate_key_hex(&opts.key)?;
     if opts.key_id.is_empty() {
         return Err("--key-id must not be empty".to_string());
     }
-    let valid_version = !opts.key_version.is_empty()
-        && opts.key_version.bytes().all(|b| b.is_ascii_digit())
-        && opts
-            .key_version
-            .parse::<u64>()
-            .is_ok_and(|v| (1..=u32::MAX as u64).contains(&v));
-    if !valid_version {
-        return Err("--key-version must be a decimal integer between 1 and 4294967295".to_string());
+    // sign's input grammar for the version is decimal command-line text; the
+    // numeric window it must fall in is the shared rule. The decoded integer
+    // is the only representation carried onward, so "007"/"7" authenticate and
+    // render identically and the text is never parsed a second time.
+    let key_version = parse_cli_key_version(&opts.key_version)?;
+    Ok(SignOptions {
+        key: opts.key,
+        key_id: opts.key_id,
+        key_version,
+        fields: opts.fields,
+    })
+}
+
+/// Decode sign's `--key-version` text into an integer under the shared
+/// key-version rule. Command-line spellings are decimal only: a non-empty run
+/// of ASCII digits (leading zeros permitted, so "007" is 7), whose value lies
+/// in `1..=4294967295`. Anything else — empty, a sign, a fraction, an
+/// exponent, embedded/leading/trailing whitespace, or an out-of-range value —
+/// is rejected. The rejected text is never part of the message.
+fn parse_cli_key_version(text: &str) -> Result<u32, String> {
+    const RANGE_HINT: &str =
+        "--key-version must be a decimal integer between 1 and 4294967295";
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(RANGE_HINT.to_string());
     }
-    Ok(opts)
+    // Grammar above bounds the run to ASCII digits; this parse can only fail
+    // on magnitude, which is the range rejection below.
+    let version: u64 = text.parse().map_err(|_| RANGE_HINT.to_string())?;
+    let version = u32::try_from(version).map_err(|_| RANGE_HINT.to_string())?;
+    if auth::is_supported_key_version(version) {
+        Ok(version)
+    } else {
+        Err(RANGE_HINT.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -567,19 +629,21 @@ fn record_from_json(value: &json::JsonValue) -> Result<AuthRecord, String> {
     let key_version = key_version.ok_or("record is missing required member \"key_version\"")?;
     let key_version = match key_version {
         json::JsonValue::Number(n) => {
-            // Only the 1..=u32::MAX window is a legal key version. In
-            // particular, an integer wider than `i128` stays an out-of-range
-            // key version — it must never be misreported as an unsupported
-            // record format.
-            match n.as_i128() {
-                Some(v) if (1..=i128::from(u32::MAX)).contains(&v) => v as u32,
-                _ => {
-                    return Err(
-                        "member \"key_version\" is outside the supported range 1..=4294967295"
-                            .to_string(),
-                    )
-                }
-            }
+            // verify's input grammar is the strict JSON integer the parser
+            // already enforced (strings, fractions, exponents and leading
+            // zeros never reach here); the accepted numeric window is the
+            // single shared key-version rule. Zero and negatives fail the
+            // conversion, values above u32::MAX fail it, and an integer wider
+            // than `i128` has no exact value at all: all stay out-of-range key
+            // versions, never truncated/wrapped and never misreported as an
+            // unsupported record format.
+            n.as_i128()
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| auth::is_supported_key_version(*v))
+                .ok_or_else(|| {
+                    "member \"key_version\" is outside the supported range 1..=4294967295"
+                        .to_string()
+                })?
         }
         _ => return Err("member \"key_version\" must be an integer".to_string()),
     };
