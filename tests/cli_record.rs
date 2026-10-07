@@ -4256,3 +4256,242 @@ fn verify_algorithm_missing_or_non_string_keeps_its_own_reason() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// verify: JSON layout whitespace vs message content whitespace
+//
+// The two kinds of "whitespace" must never be unified:
+//   * JSON layout whitespace — exactly U+0020, U+0009, U+000A, U+000D — may be
+//     added or removed anywhere JSON allows it without changing the decoded
+//     record, so a reformatted record keeps its verification result;
+//   * every other space-like character (here: U+00A0 NO-BREAK SPACE and
+//     U+3000 IDEOGRAPHIC SPACE) is NOT JSON whitespace. Outside strings it is
+//     corrupt input (exit 2); inside a field string it is ordinary message
+//     content that participates in the tag byte-for-byte and must never be
+//     trimmed, replaced by a plain space, or treated as an empty field.
+// Golden tags below are independent Python HMAC-SHA256 values over the
+// format-1 contract in README.md, never derived from this crate.
+// ---------------------------------------------------------------------------
+
+const WS_KEY: &str = "00ff";
+/// A different but well-formed key: a wrong key must turn a structurally
+/// legal record into a mismatch, never into corrupt input or a success.
+const WS_WRONG_KEY: &str = "0102";
+const WS_KID: &str = "wsprobe";
+/// Golden tag for fields ["\u{a0}"] (key 00ff, key_id "wsprobe", version 1).
+const WS_TAG_NBSP_ONLY: &str = "e4eb0f7b56e3633e8e1b282dd84e4a954f33e99f50308d2a39962f74261dffca";
+/// Golden tag for fields ["\u{3000}"].
+const WS_TAG_IDEO_ONLY: &str = "5d95669223670d9e8b38f81825d92ff54063c26934e7cd1de5e3755b76db0582";
+/// Golden tag for fields ["\u{a0}\u{3000}"] (a field composed solely of the
+/// space-like characters).
+const WS_TAG_NBSP_IDEO: &str = "a9fdc3abfe19ed0c40ab9a78283f2b495fbfe8125b4a0f678c2f0073ea7b2e75";
+/// Golden tag for fields ["x\u{a0}", "\u{3000}y"] (characters at field
+/// boundaries).
+const WS_TAG_LEAD_TRAIL: &str = "1e34c78d4075380fb00325c563f35f7e3b36282c66647d4f4c41bda05179dbef";
+/// Golden tag for fields ["a\u{a0}b\u{3000}c"].
+const WS_TAG_MIXED_INNER: &str = "0843f6bbaad105d3423ac13e714ecb4ce3f35ebb497c6ae9b09de77eb0a0cca3";
+
+/// Hand-author a format-1 record around a raw `fields` JSON array and tag.
+fn ws_record(fields_json: &str, tag: &str) -> String {
+    format!(
+        r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"{WS_KID}","key_version":1,"fields":{fields_json},"tag":"{tag}"}}"#
+    )
+}
+
+/// Render field texts as a compact JSON array (the test fields contain no
+/// quotes or backslashes, so plain wrapping is exact).
+fn ws_fields_json(fields: &[&str]) -> String {
+    let inner: Vec<String> = fields.iter().map(|f| format!("\"{f}\"")).collect();
+    format!("[{}]", inner.join(","))
+}
+
+/// Successful verification: exit 0, exactly one {"valid":true} line, empty
+/// stderr.
+fn expect_ws_valid(label: &str, input: &[u8], key: &str) {
+    let out = run_verify(key, input);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{label}: expected exit 0, stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n", "{label}: stdout");
+    assert!(
+        out.stderr.is_empty(),
+        "{label}: stderr must be empty, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Authentication mismatch: exit 1, exactly one {"valid":false} line, empty
+/// stderr.
+fn expect_ws_mismatch(label: &str, input: &[u8], key: &str) {
+    let out = run_verify(key, input);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{label}: expected mismatch (exit 1), stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":false}\n", "{label}: stdout");
+    assert!(
+        out.stderr.is_empty(),
+        "{label}: stderr must be empty, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn verify_json_layout_whitespace_reformatting_keeps_the_result() {
+    // A complete, correctly tagged record; the compact body carries no JSON
+    // whitespace of its own.
+    let body = String::from_utf8(sign_record_bytes(WS_KEY, WS_KID, "1", &["hello", "世界"]))
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+
+    // Each JSON whitespace character (U+0020, U+0009, U+000A, U+000D) on its
+    // own, at every position JSON allows it: around the whole object, around
+    // member colons, and around commas (member gaps and array element gaps).
+    let mut variants: Vec<String> = Vec::new();
+    for w in [' ', '\t', '\n', '\r'] {
+        variants.push(format!("{w}{body}{w}"));
+        variants.push(body.replace("\":", &format!("\"{w}:{w}")));
+        variants.push(body.replace(',', &format!("{w},{w}")));
+    }
+    // All four mixed at every allowed position at once.
+    variants.push(format!(
+        " \t\r\n{}\r\n\t ",
+        body.replace("\":", "\" \t:\r\n").replace(',', "\n \t,\r ")
+    ));
+
+    for (index, variant) in variants.iter().enumerate() {
+        let label = format!("variant {index}");
+        // Reformatting must not change the decoded content or its boundaries:
+        // the original tag still authenticates under the record's key.
+        expect_ws_valid(&label, variant.as_bytes(), WS_KEY);
+        // ...and the same reformatted record under a wrong key stays a plain
+        // mismatch — layout whitespace cannot launder a key mismatch.
+        expect_ws_mismatch(&label, variant.as_bytes(), WS_WRONG_KEY);
+    }
+}
+
+#[test]
+fn verify_nbsp_and_ideographic_space_outside_strings_are_corrupt_input() {
+    // A complete, correctly tagged record with distinctive content, so any
+    // echo of the key id, field text or tag in stderr is detectable.
+    let field = "wsprobe-field";
+    let body = String::from_utf8(sign_record_bytes(WS_KEY, WS_KID, "1", &[field]))
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+    let tag = Json::parse(&body).get("tag").as_str().to_string();
+
+    // U+00A0 and U+3000 look like spacing but are not JSON whitespace: before
+    // the object, after the complete object, or between members they make the
+    // input corrupt.
+    let mut variants: Vec<String> = Vec::new();
+    for c in ['\u{a0}', '\u{3000}'] {
+        variants.push(format!("{c}{body}")); // before the object
+        variants.push(format!("{body}{c}")); // after the complete object
+        variants.push(format!("{body}\n{c}")); // after the object's trailing newline
+        variants.push(body.replacen('{', &format!("{{{c}"), 1)); // before the first member
+        variants.push(body.replacen(',', &format!(",{c}"), 1)); // between members
+        variants.push(body.replacen(',', &format!("{c},"), 1)); // before a member gap's comma
+    }
+
+    for (index, variant) in variants.iter().enumerate() {
+        for key in [WS_KEY, WS_WRONG_KEY] {
+            let label = format!("variant {index}, key {key}");
+            let out = run_verify(key, variant.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{label}: corrupt input must exit 2, stdout={:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            // Neither a success nor a {"valid":false}: stdout stays empty.
+            assert!(out.stdout.is_empty(), "{label}: stdout must be empty");
+            let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+            assert!(
+                !stderr.trim().is_empty(),
+                "{label}: stderr must explain the problem"
+            );
+            // The explanation is about JSON parsing / trailing content...
+            assert!(
+                stderr.to_lowercase().contains("json"),
+                "{label}: stderr must describe the JSON problem: {stderr}"
+            );
+            // ...and never echoes the key, the key id, field content, the tag
+            // or the offending space-like character itself.
+            assert!(!stderr.contains(key), "{label}: stderr echoed the key: {stderr}");
+            assert!(!stderr.contains(WS_KID), "{label}: stderr echoed the key id: {stderr}");
+            assert!(!stderr.contains(field), "{label}: stderr echoed a field: {stderr}");
+            assert!(!stderr.contains(&tag), "{label}: stderr echoed the tag: {stderr}");
+            assert!(
+                !stderr.contains('\u{a0}') && !stderr.contains('\u{3000}'),
+                "{label}: stderr echoed the rejected character: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn verify_nbsp_and_ideographic_space_inside_fields_are_message_content() {
+    // (label, decoded field texts, independent Python golden tag). The
+    // characters sit inside fields, at field boundaries, and alone as whole
+    // fields — all legal message content.
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("nbsp-only", &["\u{a0}"], WS_TAG_NBSP_ONLY),
+        ("ideo-only", &["\u{3000}"], WS_TAG_IDEO_ONLY),
+        ("nbsp-ideo", &["\u{a0}\u{3000}"], WS_TAG_NBSP_IDEO),
+        ("lead-trail", &["x\u{a0}", "\u{3000}y"], WS_TAG_LEAD_TRAIL),
+        ("mixed-inner", &["a\u{a0}b\u{3000}c"], WS_TAG_MIXED_INNER),
+    ];
+
+    for (label, fields, golden) in cases {
+        // sign must keep the characters verbatim: the emitted record carries
+        // the independent golden tag and the fields round-trip unchanged.
+        let out = run_sign(WS_KEY, WS_KID, "1", fields);
+        assert_eq!(out.status.code(), Some(0), "{label}: sign must succeed");
+        assert!(out.stderr.is_empty(), "{label}: sign stderr must be empty");
+        let rec = parse_single_record(&out.stdout);
+        assert_eq!(rec.tag, *golden, "{label}: sign must authenticate the untrimmed text");
+        assert_eq!(
+            rec.fields,
+            fields.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "{label}: sign must not trim, replace or drop the characters"
+        );
+        // The signed record verifies: exit 0, one {"valid":true} line.
+        expect_ws_valid(label, &out.stdout, WS_KEY);
+
+        // A hand-authored record with the characters as raw UTF-8 text...
+        let raw_json = ws_fields_json(fields);
+        let raw_record = ws_record(&raw_json, golden);
+        expect_ws_valid(label, raw_record.as_bytes(), WS_KEY);
+
+        // ...and the same characters written as JSON unicode escapes decode
+        // to the same field text and verify identically.
+        let escaped_json = raw_json
+            .replace('\u{a0}', "\\u00a0")
+            .replace('\u{3000}', "\\u3000");
+        assert_ne!(raw_json, escaped_json, "{label}: case must contain the characters");
+        let escaped_record = ws_record(&escaped_json, golden);
+        expect_ws_valid(label, escaped_record.as_bytes(), WS_KEY);
+
+        // Keeping the original tag while DELETING the characters leaves a
+        // structurally legal record (possibly one now-empty field) whose
+        // content no longer matches: exactly one {"valid":false} line, exit 1.
+        let deleted_json = raw_json.replace(['\u{a0}', '\u{3000}'], "");
+        assert_ne!(deleted_json, raw_json, "{label}: deletion must change the fields");
+        let deleted_record = ws_record(&deleted_json, golden);
+        expect_ws_mismatch(label, deleted_record.as_bytes(), WS_KEY);
+
+        // Same for REPLACING each character with a plain U+0020 space: legal
+        // record, different authenticated content, plain mismatch.
+        let spaced_json = raw_json.replace('\u{a0}', " ").replace('\u{3000}', " ");
+        assert_ne!(spaced_json, raw_json, "{label}: replacement must change the fields");
+        let spaced_record = ws_record(&spaced_json, golden);
+        expect_ws_mismatch(label, spaced_record.as_bytes(), WS_KEY);
+    }
+}
