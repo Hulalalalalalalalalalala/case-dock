@@ -568,6 +568,180 @@ fn verify_reports_unsupported_format_and_algorithm_explicitly() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// verify: format versions larger than machine integer width
+//
+// A syntactically valid JSON integer of any magnitude (e.g. 2^127) is still a
+// legal decimal integer; the tool simply does not support that record format
+// version. Such a record must be reported as an unsupported *version* — exit 2,
+// empty stdout, a stderr naming format 1 as the only supported version — rather
+// than refused as malformed JSON ("integer out of range"). The conclusion must
+// not depend on the key, and tag verification must never run. Illegal number
+// spellings remain corrupt input with their own distinct messages.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verify_oversized_format_integer_is_unsupported_version_not_bad_json() {
+    let key = "00ff";
+    let other_key = "0102";
+    // Start from a genuinely valid, correctly tagged format-1 record so that
+    // the ONLY change under test is the format literal.
+    let signed = sign_record_bytes(key, "id", "1", &["x"]);
+    let body = std::str::from_utf8(&signed).unwrap().trim_end_matches('\n');
+
+    // Every legal integer spelling other than exactly 1, including zero,
+    // negatives and magnitudes far beyond i128 in both directions.
+    let formats = [
+        "0",
+        "-0",
+        "-1",
+        "2",
+        "170141183460469231731687303715884105728",  // 2^127: the reported case
+        "170141183460469231731687303715884105729",  // 2^127 + 1
+        "-170141183460469231731687303715884105729", // -(2^127 + 1)
+        "99999999999999999999999999999999999999999999999999",
+        "-99999999999999999999999999999999999999999999999999",
+    ];
+    for token in formats {
+        let rec = body.replacen("\"format\":1", &format!("\"format\":{token}"), 1);
+        for k in [key, other_key] {
+            let out = run_verify(k, rec.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "format {token}, key {k}: expected exit 2, got {:?}, stdout={:?}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(out.stdout.is_empty(), "format {token}: stdout must be empty");
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            assert!(
+                stderr.contains("unsupported record format version"),
+                "format {token}, key {k}: must classify as unsupported version: {stderr}"
+            );
+            assert!(
+                stderr.contains("only format 1 is supported"),
+                "format {token}: message must state that only format 1 is supported: {stderr}"
+            );
+            // Must not be framed as a JSON numeric-range/parse problem.
+            let lower = stderr.to_lowercase();
+            assert!(
+                !lower.contains("out of supported range") && !lower.contains("out of range"),
+                "format {token}: must not say the JSON integer is out of range: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn verify_oversized_format_integer_is_never_a_match_or_mismatch() {
+    // Even the correct key on otherwise-valid content yields neither exit 0 nor
+    // exit 1: verification stops at the format version.
+    let key = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+    let signed = sign_record_bytes(key, "demo", "3", &["hello", "世界"]);
+    let body = std::str::from_utf8(&signed).unwrap().trim_end_matches('\n');
+    let rec = body.replacen(
+        "\"format\":1",
+        "\"format\":170141183460469231731687303715884105728",
+        1,
+    );
+    let out = run_verify(key, rec.as_bytes());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+    assert!(!out.stderr.windows(14).any(|w| w == b"{\"valid\":false"));
+}
+
+#[test]
+fn verify_illegal_format_spellings_stay_corrupt_with_distinct_reasons() {
+    let key = "00ff";
+    let signed = sign_record_bytes(key, "id", "1", &["x"]);
+    let body = std::str::from_utf8(&signed).unwrap().trim_end_matches('\n').to_string();
+
+    // (replacement for the whole "format" member, expected stderr fragment)
+    let cases: &[(&str, &str)] = &[
+        (r#""format":"1""#, "must be an integer"),      // string "1"
+        (r#""format":1.0"#, "fractions and exponents"), // fraction
+        (r#""format":1e0"#, "fractions and exponents"), // exponent
+        (r#""format":01"#, "leading zeros"),            // leading zero
+    ];
+    for (member, fragment) in cases {
+        let rec = body.replacen(r#""format":1"#, member, 1);
+        assert_ne!(rec, body, "test setup must actually change format");
+        let stderr = expect_verify_invalid(rec.as_bytes(), &["--key", key]);
+        assert!(
+            stderr.to_lowercase().contains(fragment),
+            "expected message containing {fragment:?}, got: {stderr}"
+        );
+        assert!(
+            !stderr.to_lowercase().contains("unsupported"),
+            "illegal spelling must not collapse into 'unsupported version': {stderr}"
+        );
+    }
+
+    // Missing format member: its own missing-member reason.
+    let missing = body.replacen(r#""format":1,"#, "", 1);
+    let stderr = expect_verify_invalid(missing.as_bytes(), &["--key", key]);
+    assert!(stderr.contains("missing required member \"format\""), "got: {stderr}");
+
+    // Framing problems are reported as such regardless of the big integer:
+    // the version alone must never produce the conclusion on bad framing.
+    let big = body.replacen(
+        "\"format\":1",
+        "\"format\":170141183460469231731687303715884105728",
+        1,
+    );
+    let trailing = format!("{big} junk");
+    let stderr = expect_verify_invalid(trailing.as_bytes(), &["--key", key]);
+    assert!(stderr.contains("trailing"), "trailing content must be reported: {stderr}");
+    // A duplicate "format" member stays a duplicate-member parse error.
+    let duplicate = big.replacen(
+        "\"format\":170141183460469231731687303715884105728",
+        "\"format\":170141183460469231731687303715884105728,\"format\":170141183460469231731687303715884105728",
+        1,
+    );
+    let stderr = expect_verify_invalid(duplicate.as_bytes(), &["--key", key]);
+    assert!(stderr.contains("duplicate"), "duplicate member must be reported: {stderr}");
+    // Incomplete JSON stays a parse error.
+    let truncated = big.trim_end_matches('}').to_string();
+    let stderr = expect_verify_invalid(truncated.as_bytes(), &["--key", key]);
+    assert!(
+        stderr.to_lowercase().contains("json") || stderr.contains("unterminated"),
+        "incomplete JSON must be reported as a parse problem: {stderr}"
+    );
+}
+
+#[test]
+fn verify_oversized_key_version_is_not_reported_as_unsupported_format() {
+    let key = "00ff";
+    let other_key = "0102";
+    let signed = sign_record_bytes(key, "id", "1", &["x"]);
+    let body = std::str::from_utf8(&signed).unwrap().trim_end_matches('\n');
+    for token in [
+        "4294967296",
+        "170141183460469231731687303715884105728",
+        "99999999999999999999999999999999999999999999999999",
+        "-99999999999999999999999999999999999999999999999999",
+    ] {
+        let rec = body.replacen("\"key_version\":1", &format!("\"key_version\":{token}"), 1);
+        for k in [key, other_key] {
+            let stderr = expect_verify_invalid(rec.as_bytes(), &["--key", k]);
+            assert!(
+                stderr.contains("key_version"),
+                "key_version {token}: must name key_version: {stderr}"
+            );
+            assert!(
+                stderr.contains("4294967295"),
+                "key_version {token}: must name the range bound: {stderr}"
+            );
+            assert!(
+                !stderr.contains("record format version"),
+                "key_version {token}: must not be reclassified as a format problem: {stderr}"
+            );
+        }
+    }
+}
+
 #[test]
 fn verify_option_errors_match_sign_and_never_echo_secrets() {
     let key = "00ff";

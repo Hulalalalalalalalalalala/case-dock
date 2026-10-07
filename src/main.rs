@@ -530,10 +530,15 @@ fn record_from_json(value: &json::JsonValue) -> Result<AuthRecord, String> {
     }
 
     // Unsupported format/algorithm must be reported as such explicitly: we do
-    // not silently fall back to the current rules and compute a result.
+    // not silently fall back to the current rules and compute a result. Every
+    // syntactically valid JSON integer other than exactly 1 is an unsupported
+    // *version* — including 0, negatives and magnitudes beyond machine integer
+    // width (`Number(None)`): the parser keeps those as legal integers rather
+    // than truncating them or refusing the JSON, so the classification here is
+    // "unsupported version", never "corrupt record".
     let format = format.ok_or("record is missing required member \"format\"")?;
     match format {
-        json::JsonValue::Number(n) if *n == i128::from(auth::FORMAT_VERSION) => {}
+        json::JsonValue::Number(Some(n)) if *n == i128::from(auth::FORMAT_VERSION) => {}
         json::JsonValue::Number(_) => {
             return Err("unsupported record format version; only format 1 is supported".to_string())
         }
@@ -562,7 +567,16 @@ fn record_from_json(value: &json::JsonValue) -> Result<AuthRecord, String> {
 
     let key_version = key_version.ok_or("record is missing required member \"key_version\"")?;
     let key_version = match key_version {
-        json::JsonValue::Number(n) => {
+        // `None` is an integer whose magnitude exceeds i128: it is a legal JSON
+        // number but, like 0, negatives and values past u32::MAX, an illegal
+        // *key* version — never reclassified as an unsupported record format.
+        json::JsonValue::Number(None) => {
+            return Err(
+                "member \"key_version\" is outside the supported range 1..=4294967295"
+                    .to_string(),
+            )
+        }
+        json::JsonValue::Number(Some(n)) => {
             if *n < 1 || *n > i128::from(u32::MAX) {
                 return Err(
                     "member \"key_version\" is outside the supported range 1..=4294967295"
@@ -639,8 +653,13 @@ mod json {
     #[derive(Debug, PartialEq)]
     pub enum JsonValue {
         /// Parsed as an integer because the record grammar has no fractional
-        /// values; the width comfortably covers u32 and common JSON integers.
-        Number(i128),
+        /// values. `Some(v)` carries the value when it fits in `i128`; `None`
+        /// is still a *valid* JSON integer, just one whose magnitude exceeds
+        /// `i128`. It is never truncated or wrapped — the record-level checks
+        /// (supported format version, key-version range) classify such a value
+        /// explicitly, so the parser never reports a vague "number out of
+        /// range" for well-formed JSON.
+        Number(Option<i128>),
         String(String),
         Array(Vec<JsonValue>),
         /// Members kept in source order; names are unique (parser-enforced).
@@ -923,6 +942,12 @@ mod json {
 
         /// Strict RFC 8259 integer grammar. The record format has no fractional
         /// values, so `.`/`e` forms are rejected rather than truncated.
+        ///
+        /// A syntactically legal integer of ANY magnitude parses successfully:
+        /// when it does not fit in `i128` it becomes `Number(None)`. Magnitude
+        /// is a record-level concern (the supported format version and the
+        /// key-version range), where the error can name the actual rule,
+        /// instead of the parser rejecting well-formed JSON as "out of range".
         fn parse_number(&mut self) -> Result<JsonValue, String> {
             let start = self.pos;
             if self.peek() == Some(b'-') {
@@ -952,9 +977,10 @@ mod json {
             }
             let text = std::str::from_utf8(&self.bytes[start..self.pos])
                 .map_err(|_| "invalid UTF-8 in JSON number".to_string())?;
-            text.parse::<i128>()
-                .map(JsonValue::Number)
-                .map_err(|_| "JSON integer is out of supported range".to_string())
+            // An integer that does not fit stays a valid JSON number with no
+            // fixed-width value; it is never truncated or treated as another
+            // value.
+            Ok(JsonValue::Number(text.parse::<i128>().ok()))
         }
     }
 }
@@ -1270,6 +1296,208 @@ mod tests {
                 other => panic!("expected Invalid, got {other:?} for {rec}"),
             }
         }
+    }
+
+    /// A well-formed record whose `format` is any syntactically legal JSON
+    /// integer other than exactly 1 must be rejected as an unsupported
+    /// *version* (exit 2), never as corrupt JSON and never by continuing to
+    /// the tag check (which could yield a mismatch). This is the regression for
+    /// the 170141183460469231731687303715884105728 case: that magnitude
+    /// exceeds i128, but it is still a valid JSON decimal integer.
+    #[test]
+    fn verify_any_integer_format_other_than_1_is_unsupported_version() {
+        let key = "00ff";
+        let other_key = "0102";
+        let tag = "a".repeat(64);
+        // Zero, negatives, other small versions, i128 boundaries, and values
+        // beyond i128 width in both signs.
+        let formats = [
+            "0",
+            "-0",
+            "-1",
+            "2",
+            "2147483648",
+            &i128::MAX.to_string(),
+            &i128::MIN.to_string(),
+            "170141183460469231731687303715884105727", // 2^127 - 1
+            "170141183460469231731687303715884105728", // 2^127 (the reported value)
+            "170141183460469231731687303715884105729", // 2^127 + 1
+            "-170141183460469231731687303715884105729", // -(2^127 + 1)
+            "99999999999999999999999999999999999999999999999999",
+            "-99999999999999999999999999999999999999999999999999",
+        ];
+        for token in formats {
+            let rec = format!(
+                "{{\"format\":{token},\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\
+                 \"key_version\":1,\"fields\":[\"x\"],\"tag\":\"{tag}\"}}"
+            );
+            for k in [key, other_key] {
+                match verify_input(rec.as_bytes(), k) {
+                    VerifyOutcome::Invalid(msg) => {
+                        assert!(
+                            msg.contains("unsupported record format version"),
+                            "format {token}: expected unsupported-version message, got: {msg}"
+                        );
+                        assert!(
+                            msg.contains("only format 1 is supported"),
+                            "format {token}: message must name format 1: {msg}"
+                        );
+                    }
+                    other => panic!(
+                        "format {token}, key {k}: expected Invalid unsupported version, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The version decision is independent of the tag: a record that would be
+    /// valid under format 1 is still "unsupported version" once its format is
+    /// changed, whether the key matches the authenticated content or not.
+    #[test]
+    fn unsupported_format_takes_precedence_over_tag_verification() {
+        let key = "00ff";
+        let base = record_for(key, "id", 1, &["x"]);
+        for token in ["2", "170141183460469231731687303715884105728", "-1"] {
+            let rec = base.replacen("\"format\":1", &format!("\"format\":{token}"), 1);
+            assert!(
+                matches!(
+                    verify_input(rec.as_bytes(), key),
+                    VerifyOutcome::Invalid(ref m)
+                        if m.contains("unsupported record format version")
+                ),
+                "correct key, format {token}: must be unsupported version, never valid"
+            );
+            assert!(
+                matches!(
+                    verify_input(rec.as_bytes(), "0102"),
+                    VerifyOutcome::Invalid(ref m)
+                        if m.contains("unsupported record format version")
+                ),
+                "wrong key, format {token}: must be unsupported version, never a mismatch"
+            );
+        }
+    }
+
+    /// Illegal *spellings* of `format` remain corrupt input with their own
+    /// distinct reasons: the oversized-integer fix must not launder strings,
+    /// fractions, exponents, leading zeros or a missing member into a
+    /// supported/unsupported version result.
+    #[test]
+    fn illegal_format_spellings_keep_their_distinct_errors() {
+        let key = "00ff";
+        let tag = "a".repeat(64);
+        let rec = |format_text: &str| {
+            format!(
+                "{{\"format\":{format_text},\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\
+                 \"key_version\":1,\"fields\":[\"x\"],\"tag\":\"{tag}\"}}"
+            )
+        };
+        let cases: &[(&str, &str)] = &[
+            (r#""1""#, "must be an integer"),
+            ("1.0", "fractions and exponents"),
+            ("1e0", "fractions and exponents"),
+            ("01", "leading zeros"),
+            ("-01", "leading zeros"),
+            ("true", "must be an integer"),
+        ];
+        for (token, expected_fragment) in cases {
+            match verify_input(rec(token).as_bytes(), key) {
+                VerifyOutcome::Invalid(msg) => {
+                    assert!(
+                        msg.contains(expected_fragment),
+                        "format {token}: expected a message containing {expected_fragment:?}, got: {msg}"
+                    );
+                    assert!(
+                        !msg.contains("unsupported"),
+                        "format {token}: must not be reported as merely unsupported: {msg}"
+                    );
+                }
+                other => panic!("format {token}: expected Invalid, got {other:?}"),
+            }
+        }
+
+        // A missing format member is still a missing-member error.
+        let missing = format!(
+            "{{\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\"key_version\":1,\
+             \"fields\":[\"x\"],\"tag\":\"{tag}\"}}"
+        );
+        match verify_input(missing.as_bytes(), key) {
+            VerifyOutcome::Invalid(msg) => {
+                assert!(msg.contains("missing required member \"format\""), "got: {msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// An oversized `key_version` integer is still an illegal key version
+    /// (range error), never reclassified as an unsupported record format.
+    #[test]
+    fn oversized_key_version_is_a_key_version_range_error() {
+        let key = "00ff";
+        let tag = "a".repeat(64);
+        for token in [
+            "4294967296",
+            "170141183460469231731687303715884105728",
+            "99999999999999999999999999999999999999999999999999",
+            "-170141183460469231731687303715884105728",
+        ] {
+            let rec = format!(
+                "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\
+                 \"key_version\":{token},\"fields\":[\"x\"],\"tag\":\"{tag}\"}}"
+            );
+            for k in [key, "0102"] {
+                match verify_input(rec.as_bytes(), k) {
+                    VerifyOutcome::Invalid(msg) => {
+                        assert!(
+                            msg.contains("key_version") && msg.contains("4294967295"),
+                            "key_version {token}: expected the range error, got: {msg}"
+                        );
+                        assert!(
+                            !msg.contains("record format version"),
+                            "key_version {token}: must not be reported as a format problem: {msg}"
+                        );
+                    }
+                    other => panic!("key_version {token}: expected Invalid, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parser_keeps_oversized_integers_as_valid_numbers_without_truncating() {
+        use json::{parse_single, JsonValue};
+        // In-range integer spellings carry their exact value.
+        assert_eq!(
+            parse_single("1").unwrap(),
+            JsonValue::Number(Some(1))
+        );
+        assert_eq!(parse_single("-0").unwrap(), JsonValue::Number(Some(0)));
+        assert_eq!(
+            parse_single(&i128::MAX.to_string()).unwrap(),
+            JsonValue::Number(Some(i128::MAX))
+        );
+        assert_eq!(
+            parse_single(&i128::MIN.to_string()).unwrap(),
+            JsonValue::Number(Some(i128::MIN))
+        );
+        // Any larger magnitude is still a legal JSON number, represented as
+        // None rather than refused or wrapped to another value.
+        assert_eq!(
+            parse_single("170141183460469231731687303715884105728").unwrap(),
+            JsonValue::Number(None)
+        );
+        assert_eq!(
+            parse_single("-170141183460469231731687303715884105729").unwrap(),
+            JsonValue::Number(None)
+        );
+        assert_eq!(
+            parse_single("99999999999999999999999999999999999999999999999999").unwrap(),
+            JsonValue::Number(None)
+        );
+        // An oversized integer nested in the record still parses, so framing
+        // rules (single value, no trailing content) apply around it normally.
+        assert!(parse_single("99999999999999999999999999999999999999999999999999 1").is_err());
     }
 
     #[test]
