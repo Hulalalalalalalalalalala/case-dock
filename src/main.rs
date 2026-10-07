@@ -1646,4 +1646,85 @@ mod tests {
         // Distinct decoded names stay distinct, escape spelling or not.
         assert!(parse_single("{\"a\":1,\"\\u0062\":2}").is_ok());
     }
+
+    #[test]
+    fn verify_algorithm_name_is_matched_on_the_decoded_string() {
+        let key = "00ff";
+        let wrong_key = "0102";
+        let tag = sign_tag(key, "id", 1, &["x"]);
+        let record = |algorithm_json: &str| {
+            format!(
+                "{{\"format\":1,\"algorithm\":{algorithm_json},\"key_id\":\"id\",\"key_version\":1,\"fields\":[\"x\"],\"tag\":\"{tag}\"}}"
+            )
+        };
+
+        // Direct and unicode-escape spellings of the one supported name are
+        // the same decoded string and verify identically; under a wrong key
+        // each stays a plain mismatch.
+        for spelling in [
+            "\"HMAC-SHA256\"",
+            "\"\\u0048MAC-SHA256\"",
+            "\"HMAC\\u002dSHA256\"",
+            "\"HMAC-SHA\\u003256\"",
+            "\"\\u0048\\u004d\\u0041\\u0043\\u002d\\u0053\\u0048\\u0041\\u0032\\u0035\\u0036\"",
+        ] {
+            assert!(
+                matches!(verify_input(record(spelling).as_bytes(), key), VerifyOutcome::Valid),
+                "spelling {spelling} must verify"
+            );
+            assert!(
+                matches!(
+                    verify_input(record(spelling).as_bytes(), wrong_key),
+                    VerifyOutcome::Mismatch
+                ),
+                "spelling {spelling} under a wrong key must mismatch"
+            );
+        }
+
+        // Any other decoded string is unsupported — even though this
+        // record's tag genuinely matches under HMAC-SHA256 with `key`.
+        // Case variants, surrounding whitespace, the empty string and an
+        // escaped unsupported name alike, under either key.
+        for spelling in [
+            "\"HMAC-SHA512\"",
+            "\"hmac-sha256\"",
+            "\" HMAC-SHA256\"",
+            "\"HMAC-SHA256 \"",
+            "\"\"",
+            "\"HMAC-SHA\\u003512\"",
+        ] {
+            for k in [key, wrong_key] {
+                match verify_input(record(spelling).as_bytes(), k) {
+                    VerifyOutcome::Invalid(msg) => {
+                        assert!(msg.contains("unsupported"), "{spelling}: {msg}");
+                        assert!(msg.contains("HMAC-SHA256"), "{spelling}: {msg}");
+                    }
+                    other => panic!("spelling {spelling}: expected Invalid, got {other:?}"),
+                }
+            }
+        }
+
+        // Missing and non-string keep their own corruption reasons, never a
+        // uniform "unknown algorithm" reading.
+        let missing = format!(
+            "{{\"format\":1,\"key_id\":\"id\",\"key_version\":1,\"fields\":[\"x\"],\"tag\":\"{tag}\"}}"
+        );
+        match verify_input(missing.as_bytes(), key) {
+            VerifyOutcome::Invalid(msg) => {
+                assert!(msg.contains("missing required member \"algorithm\""), "{msg}");
+                assert!(!msg.contains("unsupported"), "{msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        for token in ["1", "true", "null", "[\"HMAC-SHA256\"]"] {
+            match verify_input(record(token).as_bytes(), key) {
+                VerifyOutcome::Invalid(msg) => {
+                    assert!(msg.contains("must be a string"), "{token}: {msg}");
+                    assert!(!msg.contains("unsupported"), "{token}: {msg}");
+                }
+                other => panic!("token {token}: expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
 }

@@ -4048,3 +4048,211 @@ fn verify_external_ufffd_records_follow_the_same_encoding_rules() {
         &["line1", "标签"],
     );
 }
+
+// ---------------------------------------------------------------------------
+// verify: the `algorithm` member is matched by its JSON-decoded text
+//
+// Format 1 authenticates with HMAC-SHA256 only. A record whose tag recomputes
+// correctly under HMAC-SHA256 must STILL be rejected when its `algorithm`
+// member names anything else: the declared algorithm is record structure,
+// checked before any authentication happens, and a matching tag can never
+// launder an unsupported name into an accepted record — or even into a
+// {"valid":false} mismatch. The name is judged by the JSON-decoded string,
+// so legal \u escape spellings of "HMAC-SHA256" are the same supported name,
+// while escape spellings of unsupported names stay unsupported.
+//
+// The records below are hand-authored as if produced by an external program
+// that only knows the published format-1 contract; `sign` is never invoked.
+// The tag is an independent Python golden (hmac/hashlib/struct over the byte
+// recipe in README.md) for key 00ff, key_id "alg-probe-kid", version 1, one
+// field "alg-probe-field" — never derived from this crate's own HMAC code.
+// ---------------------------------------------------------------------------
+
+const ALG_KEY: &str = "00ff";
+/// A different but well-formed key: swapping keys must never change a
+/// structural conclusion about the algorithm member.
+const ALG_WRONG_KEY: &str = "0102";
+const ALG_KID: &str = "alg-probe-kid";
+const ALG_FIELD: &str = "alg-probe-field";
+/// Independent Python golden tag for (ALG_KEY, ALG_KID, 1, [ALG_FIELD]).
+const ALG_TAG: &str = "df25014ecc3f6448f43d4fe20cb171692ebc41ce081ba0de7e911a0d0b58c3d9";
+
+/// Hand-author a complete format-1 record whose `algorithm` member is the
+/// given raw JSON token (a quoted string, or any non-string value). Every
+/// other member is legal and the tag is the genuine HMAC-SHA256 tag for
+/// ALG_KEY, so any rejection is attributable to the algorithm member alone.
+fn alg_record(algorithm_json: &str) -> String {
+    format!(
+        r#"{{"format":1,"algorithm":{algorithm_json},"key_id":"{ALG_KID}","key_version":1,"fields":["{ALG_FIELD}"],"tag":"{ALG_TAG}"}}"#
+    )
+}
+
+#[test]
+fn verify_algorithm_name_is_matched_as_the_decoded_string() {
+    // Every spelling below decodes to exactly "HMAC-SHA256": the direct
+    // spelling and legal \u escape spellings (of the first letter, the
+    // hyphen, each digit, and the whole name). The algorithm is judged by
+    // the decoded string, so all of them are the same supported name and
+    // the record — carrying the genuine golden tag — verifies identically.
+    let decoded_equivalents: &[(&str, &str)] = &[
+        ("direct", r#""HMAC-SHA256""#),
+        ("escaped H", r#""\u0048MAC-SHA256""#),
+        ("escaped hyphen", r#""HMAC\u002dSHA256""#),
+        ("escaped digit 2", r#""HMAC-SHA\u003256""#),
+        ("escaped digit 6", r#""HMAC-SHA25\u0036""#),
+        ("fully escaped", r#""\u0048\u004d\u0041\u0043\u002d\u0053\u0048\u0041\u0032\u0035\u0036""#),
+    ];
+    for (label, spelling) in decoded_equivalents {
+        let rec = alg_record(spelling);
+
+        // Correct key + matching tag: exactly one {"valid":true} line,
+        // exit 0, empty stderr — identical for every equivalent spelling.
+        let out = run_verify(ALG_KEY, rec.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{label}: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}: stderr must be empty");
+
+        // Another well-formed but wrong key: exactly one {"valid":false}
+        // line, exit 1, empty stderr. The equivalent escape spelling must
+        // not change the tag's validity in either direction.
+        let out = run_verify(ALG_WRONG_KEY, rec.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{label}: wrong key must mismatch, stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":false}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}: stderr must be empty");
+    }
+}
+
+#[test]
+fn verify_unsupported_algorithm_names_are_rejected_despite_matching_tag() {
+    // Every record below carries the GENUINE HMAC-SHA256 golden tag: under
+    // the current algorithm the tag would match (the previous test proves
+    // it). The declared name must still win — the outcome is exit 2 with
+    // empty stdout, never exit 0 and never a {"valid":false} authentication
+    // result, and swapping in another well-formed key changes nothing.
+    //
+    // Each row's third element is a distinctive substring of the rejected
+    // name that stderr must not echo (empty when the name differs from the
+    // supported one only by letter case or surrounding whitespace, where a
+    // substring check cannot tell the two apart).
+    let cases: &[(&str, &str, &str)] = &[
+        // (label, raw JSON string token, distinctive rejected text)
+        ("another HMAC variant", r#""HMAC-SHA512""#, "HMAC-SHA512"),
+        ("lowercase", r#""hmac-sha256""#, ""),
+        ("mixed case", r#""Hmac-Sha256""#, ""),
+        ("leading space", r#"" HMAC-SHA256""#, ""),
+        ("trailing space", r#""HMAC-SHA256 ""#, ""),
+        ("leading tab", r#""\tHMAC-SHA256""#, ""),
+        ("trailing tab", r#""HMAC-SHA256\t""#, ""),
+        ("empty string", r#""""#, ""),
+        ("name without prefix", r#""SHA256""#, ""),
+        ("compact jwt-style name", r#""HS256""#, "HS256"),
+        ("escaped unsupported name", r#""HMAC-SHA\u003512""#, "0035"),
+        ("escaped lowercase name", r#""\u0068mac-sha256""#, "0068"),
+    ];
+    for (label, token, rejected_text) in cases {
+        let rec = alg_record(token);
+        for key in [ALG_KEY, ALG_WRONG_KEY] {
+            let out = run_verify(key, rec.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{label}: unsupported algorithm must exit 2 (key={key}), stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // No authentication result of either kind may be produced.
+            assert!(
+                out.stdout.is_empty(),
+                "{label}: stdout must be empty on exit 2, got {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+            let lower = stderr.to_lowercase();
+            assert!(
+                lower.contains("unsupported"),
+                "{label}: stderr must say the algorithm is unsupported: {stderr}"
+            );
+            assert!(
+                lower.contains("algorithm"),
+                "{label}: stderr must name the algorithm member: {stderr}"
+            );
+            assert!(
+                stderr.contains("HMAC-SHA256"),
+                "{label}: stderr must say only HMAC-SHA256 is supported: {stderr}"
+            );
+            // Never echo the key, record content, the tag, or the rejected
+            // algorithm value.
+            assert!(!stderr.contains(key), "{label}: stderr echoed the key: {stderr}");
+            assert!(!stderr.contains(ALG_KID), "{label}: stderr echoed the key id: {stderr}");
+            assert!(!stderr.contains(ALG_FIELD), "{label}: stderr echoed a field: {stderr}");
+            assert!(!stderr.contains(ALG_TAG), "{label}: stderr echoed the tag: {stderr}");
+            if !rejected_text.is_empty() {
+                assert!(
+                    !stderr.contains(rejected_text),
+                    "{label}: stderr echoed the rejected algorithm name: {stderr}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn verify_algorithm_missing_or_non_string_keeps_its_own_reason() {
+    // A missing member and a non-string member are record corruption with
+    // their own distinct reasons — never folded into a uniform
+    // "unknown/unsupported algorithm" conclusion. Both exit 2 with empty
+    // stdout, under either well-formed key.
+    let missing = format!(
+        r#"{{"format":1,"key_id":"{ALG_KID}","key_version":1,"fields":["{ALG_FIELD}"],"tag":"{ALG_TAG}"}}"#
+    );
+    for key in [ALG_KEY, ALG_WRONG_KEY] {
+        let stderr = expect_verify_invalid(missing.as_bytes(), &["--key", key]);
+        assert!(
+            stderr.contains("missing required member \"algorithm\""),
+            "missing algorithm must keep the missing-member reason: {stderr}"
+        );
+        assert!(
+            !stderr.to_lowercase().contains("unsupported"),
+            "a missing member is not an unsupported algorithm: {stderr}"
+        );
+        assert!(!stderr.contains(key), "stderr echoed the key: {stderr}");
+        assert!(!stderr.contains(ALG_KID), "stderr echoed the key id: {stderr}");
+        assert!(!stderr.contains(ALG_FIELD), "stderr echoed a field: {stderr}");
+        assert!(!stderr.contains(ALG_TAG), "stderr echoed the tag: {stderr}");
+    }
+
+    // Present but not a JSON string: a type error naming the member, not an
+    // unsupported-name conclusion — even when the value is an array that
+    // contains the supported name.
+    for token in ["1", "true", "null", "[\"HMAC-SHA256\"]", "{}"] {
+        let rec = alg_record(token);
+        for key in [ALG_KEY, ALG_WRONG_KEY] {
+            let stderr = expect_verify_invalid(rec.as_bytes(), &["--key", key]);
+            assert!(
+                stderr.contains("\"algorithm\""),
+                "token {token}: stderr must name the member: {stderr}"
+            );
+            assert!(
+                stderr.contains("must be a string"),
+                "token {token}: stderr must report the type problem: {stderr}"
+            );
+            assert!(
+                !stderr.to_lowercase().contains("unsupported"),
+                "token {token}: a type error is not an unsupported algorithm: {stderr}"
+            );
+            assert!(!stderr.contains(key), "token {token}: stderr echoed the key: {stderr}");
+            assert!(!stderr.contains(ALG_KID), "token {token}: stderr echoed the key id: {stderr}");
+            assert!(!stderr.contains(ALG_FIELD), "token {token}: stderr echoed a field: {stderr}");
+            assert!(!stderr.contains(ALG_TAG), "token {token}: stderr echoed the tag: {stderr}");
+        }
+    }
+}
