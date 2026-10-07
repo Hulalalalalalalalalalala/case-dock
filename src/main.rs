@@ -171,7 +171,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "       authnote sign --key HEX --key-id ID --key-version N [--field TEXT]..."
             );
-            eprintln!("       authnote verify --key HEX");
+            eprintln!("       authnote verify --key HEX [--expected-fields JSON]");
             ExitCode::from(2)
         }
     }
@@ -450,28 +450,53 @@ fn validate_sign_args(opts: RawSignOptions) -> Result<SignOptions, String> {
 
 fn verify(args: &[String]) -> ExitCode {
     // verify deliberately shares sign's option grammar through the common
-    // parser but declares its own, narrower table: --key is the only known
-    // option, so every sign-only option (--key-id, --key-version, --field)
-    // is rejected here as unrecognized. Values that fail are never echoed
-    // (they could be a mistyped secret).
-    const VERIFY_OPTIONS: &[options::Spec] = &[options::Spec {
-        name: "--key",
-        multiplicity: options::Multiplicity::Single,
-    }];
+    // parser but declares its own table: --key is the only credential option;
+    // the optional, single-use --expected-fields asks for a second check that
+    // the record's authenticated fields equal a separately held message. Every
+    // sign-only option (--key-id, --key-version, --field) is rejected here as
+    // unrecognized. Values that fail are never echoed (they could be a
+    // mistyped secret).
+    const VERIFY_OPTIONS: &[options::Spec] = &[
+        options::Spec {
+            name: "--key",
+            multiplicity: options::Multiplicity::Single,
+        },
+        options::Spec {
+            name: "--expected-fields",
+            multiplicity: options::Multiplicity::Single,
+        },
+    ];
+    const VERIFY_KEY_INDEX: usize = 0;
+    const VERIFY_EXPECTED_INDEX: usize = 1;
 
-    let parse = (|| -> Result<String, String> {
+    let parse = (|| -> Result<(String, Option<Vec<String>>), String> {
         let occurrences = options::parse(args, VERIFY_OPTIONS)?;
-        // The parser enforces "at most one --key"; take it if present.
-        let key = occurrences
-            .first()
-            .map(|o| o.value.clone())
-            .ok_or("missing required option --key")?;
+        // The parser enforces "at most once" for each single-use option; take
+        // whichever were present.
+        let mut key: Option<String> = None;
+        let mut expected_text: Option<String> = None;
+        for occurrence in occurrences {
+            match occurrence.spec_index {
+                VERIFY_KEY_INDEX => key = Some(occurrence.value),
+                VERIFY_EXPECTED_INDEX => expected_text = Some(occurrence.value),
+                _ => unreachable!("verify option table has only two entries"),
+            }
+        }
+        let key = key.ok_or("missing required option --key")?;
         auth::validate_key_hex(&key)?;
-        Ok(key)
+        // An absent --expected-fields leaves verify's public behavior exactly
+        // as it was: only the record's own tag is checked. A present value is
+        // validated here, before stdin is read, as a strictly framed array of
+        // strings; the rejected text is never quoted back.
+        let expected = match expected_text {
+            Some(text) => Some(parse_expected_fields(&text)?),
+            None => None,
+        };
+        Ok((key, expected))
     })();
 
-    let key_hex = match parse {
-        Ok(key) => key,
+    let (key_hex, expected) = match parse {
+        Ok(parsed) => parsed,
         Err(msg) => {
             eprintln!("authnote verify: {msg}");
             return ExitCode::from(2);
@@ -486,7 +511,7 @@ fn verify(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let outcome = verify_input(&input, &key_hex);
+    let outcome = verify_input(&input, &key_hex, expected.as_deref());
     match outcome {
         VerifyOutcome::Valid => {
             println!("{{\"valid\":true}}");
@@ -503,6 +528,69 @@ fn verify(args: &[String]) -> ExitCode {
     }
 }
 
+/// Validate the text of `--expected-fields` as exactly one complete JSON array
+/// whose elements are all strings, and return the decoded elements in order.
+///
+/// This is an invocation error (exit 2), never a `{"valid":false}` result: the
+/// comparison cannot even be posed unless the expectation itself is well
+/// formed. Like the record, surrounding JSON whitespace is allowed but any
+/// trailing non-whitespace content is rejected, and so are `null`, damaged
+/// JSON, non-array values and arrays containing anything but strings. Note
+/// that both `[]` (zero fields) and `[""]` (one empty field) parse here; they
+/// stay distinct values and compare distinctly later.
+///
+/// The rejected text is never included in the error: it is user-supplied
+/// message content that may be sensitive.
+fn parse_expected_fields(text: &str) -> Result<Vec<String>, String> {
+    let value = match json::parse_one(text) {
+        Ok(v) => v,
+        Err(json::ParseError::Empty) => {
+            // An explicit empty value (--expected-fields=) is distinct from
+            // the option being omitted, so name it as such.
+            return Err(
+                "--expected-fields requires a value: one JSON array of strings".to_string()
+            );
+        }
+        Err(json::ParseError::Trailing) => {
+            return Err(
+                "--expected-fields must be exactly one JSON array with no trailing content"
+                    .to_string(),
+            );
+        }
+        // The parser's grammar-level reason quotes no input, so appending it
+        // explains the damage without echoing the rejected text.
+        Err(json::ParseError::Syntax(msg)) => {
+            return Err(format!(
+                "--expected-fields must be one complete JSON array of strings; invalid JSON: {msg}"
+            ));
+        }
+    };
+    match value {
+        json::JsonValue::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    // Decoded text only: JSON layout, escaping and \u
+                    // spellings compare after decoding, with no trimming,
+                    // merging or Unicode normalization (the parser performs
+                    // none of those).
+                    json::JsonValue::String(s) => out.push(s),
+                    _ => {
+                        return Err(
+                            "every element of --expected-fields must be a JSON string".to_string()
+                        )
+                    }
+                }
+            }
+            Ok(out)
+        }
+        json::JsonValue::Null => Err(
+            "--expected-fields must be a JSON array of strings, not null".to_string(),
+        ),
+        _ => Err("--expected-fields must be a JSON array of strings".to_string()),
+    }
+}
+
 #[derive(Debug)]
 enum VerifyOutcome {
     Valid,
@@ -510,7 +598,17 @@ enum VerifyOutcome {
     Invalid(String),
 }
 
-fn verify_input(input: &[u8], key_hex: &str) -> VerifyOutcome {
+/// Verify one record from stdin, optionally also checking its authenticated
+/// fields against a separately held expected message.
+///
+/// The authentication check always comes first and stands on its own: a
+/// record whose tag does not match is a `Mismatch` whether or not an
+/// expectation was supplied, and a record that is corrupt or uses an
+/// unsupported format/algorithm stays `Invalid` under the existing rules — a
+/// different expectation never changes those classifications. Only a record
+/// that authenticates is then compared field by field with `expected`; the
+/// combined result is `Valid` exactly when both checks pass.
+fn verify_input(input: &[u8], key_hex: &str, expected: Option<&[String]>) -> VerifyOutcome {
     let text = match std::str::from_utf8(input) {
         Ok(t) => t,
         // Still parse to distinguish a structurally invalid record from a
@@ -536,10 +634,31 @@ fn verify_input(input: &[u8], key_hex: &str) -> VerifyOutcome {
         &record.fields,
     );
 
-    if auth::tags_match(&expected_tag, &record.tag) {
-        VerifyOutcome::Valid
-    } else {
-        VerifyOutcome::Mismatch
+    // Authentication is a precondition for every further conclusion. In
+    // particular a record whose fields were changed while the old tag was
+    // left in place fails here even when the expectation describes the
+    // pre-change message: a stale tag can never be rescued by a matching
+    // expectation.
+    if !auth::tags_match(&expected_tag, &record.tag) {
+        return VerifyOutcome::Mismatch;
+    }
+
+    match expected {
+        // No separately held message: authenticating the record is the whole
+        // contract, preserving verify's public behavior when the option is
+        // unused.
+        None => VerifyOutcome::Valid,
+        // Exact equality of the decoded sequences: same count, same order,
+        // same decoded text per element. Nothing is trimmed or merged, so []
+        // never matches [""], whitespace/newlines are kept in full, and
+        // repeats must repeat.
+        Some(expected) => {
+            if record.fields.as_slice() == expected {
+                VerifyOutcome::Valid
+            } else {
+                VerifyOutcome::Mismatch
+            }
+        }
     }
 }
 
@@ -785,10 +904,22 @@ mod json {
     /// array → string is depth 2) while staying well within stack limits.
     const MAX_DEPTH: usize = 64;
 
+    /// Why a document failed to be exactly one complete JSON value. Kept apart
+    /// so callers that are not parsing a *record* (the expected-message
+    /// option) can keep their own wording for the same framing problems.
+    pub enum ParseError {
+        /// The document is empty apart from JSON whitespace.
+        Empty,
+        /// A value parsed, but non-whitespace bytes followed it.
+        Trailing,
+        /// The bytes are not valid JSON; carries the grammar-level reason.
+        Syntax(String),
+    }
+
     /// Parse exactly one JSON value: optional leading/trailing JSON whitespace
     /// is allowed, but any trailing non-whitespace content (including a second
-    /// object) is an error.
-    pub fn parse_single(input: &str) -> Result<JsonValue, String> {
+    /// value) is `ParseError::Trailing`.
+    pub fn parse_one(input: &str) -> Result<JsonValue, ParseError> {
         let mut p = Parser {
             bytes: input.as_bytes(),
             pos: 0,
@@ -796,17 +927,28 @@ mod json {
         };
         p.skip_ws();
         if p.pos == p.bytes.len() {
-            return Err("input is empty; expected one JSON record".to_string());
+            return Err(ParseError::Empty);
         }
-        let value = p.parse_value()?;
+        let value = p.parse_value().map_err(ParseError::Syntax)?;
         p.skip_ws();
         if p.pos != p.bytes.len() {
-            return Err(
-                "trailing non-whitespace content after record; exactly one JSON object is allowed"
-                    .to_string(),
-            );
+            return Err(ParseError::Trailing);
         }
         Ok(value)
+    }
+
+    /// Parse exactly one JSON record, with the wording a verify caller sees:
+    /// optional leading/trailing JSON whitespace is allowed, but any trailing
+    /// non-whitespace content (including a second object) is an error.
+    pub fn parse_single(input: &str) -> Result<JsonValue, String> {
+        parse_one(input).map_err(|e| match e {
+            ParseError::Empty => "input is empty; expected one JSON record".to_string(),
+            ParseError::Syntax(msg) => msg,
+            ParseError::Trailing => {
+                "trailing non-whitespace content after record; exactly one JSON object is allowed"
+                    .to_string()
+            }
+        })
     }
 
     impl<'a> Parser<'a> {
@@ -1086,6 +1228,13 @@ mod json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Back-compat shim for the pre-`--expected-fields` tests: calling verify
+    /// without an expectation is exactly the old public contract. New tests
+    /// for the expected-message check call `super::verify_input` directly.
+    fn verify_input(input: &[u8], key_hex: &str) -> VerifyOutcome {
+        super::verify_input(input, key_hex, None)
+    }
 
     fn sign_tag(key_hex: &str, key_id: &str, version: u32, fields: &[&str]) -> String {
         let key = auth::decode_key(key_hex);
@@ -1725,6 +1874,282 @@ mod tests {
                 other => panic!("token {token}: expected Invalid, got {other:?}"),
             }
         }
+    }
+
+    // -- --expected-fields: parsing the option value ------------------------
+
+    #[test]
+    fn expected_fields_accepts_arrays_of_strings_with_framing() {
+        let parsed = |s: &str| parse_expected_fields(s).unwrap();
+        assert_eq!(parsed("[]"), Vec::<String>::new());
+        // One empty field is decoded as one element, never conflated with [].
+        assert_eq!(parsed("[\"\"]"), vec![String::new()]);
+        assert_eq!(
+            parsed("  [\n \"hello\", \"世界\", \"世界\", \"\", \" a b \", \"x=y\"\n ]  "),
+            vec![
+                "hello".to_string(),
+                "世界".to_string(),
+                "世界".to_string(),
+                String::new(),
+                " a b ".to_string(),
+                "x=y".to_string(),
+            ]
+        );
+        // Equivalent escape spellings decode to the same text.
+        assert_eq!(
+            parsed("[\"\\u4e16\\u754c\", \"世\\n界\\t\"]"),
+            vec!["世界".to_string(), "世\n界\t".to_string()]
+        );
+        // An empty *array* is distinct from whitespace padding.
+        assert_eq!(parsed(" \t\r\n [] "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn expected_fields_rejects_everything_but_one_string_array() {
+        let bad = [
+            "",
+            "   ",
+            "[",
+            "[,]",
+            "[\"a\",]",
+            "[\"a\" \"b\"]",
+            "{}",
+            "\"[\"",
+            "42",
+            "true",
+            "false",
+            "null",
+            "[1]",
+            "[true]",
+            "[null]",
+            "[[]]",
+            "[{}]",
+            "[\"a\", 1]",
+            "[\"a\", [\"b\"]]",
+            "[] []",
+            "[]x",
+            "[]42",
+            "null []",
+            "[\"a\"]trailing",
+        ];
+        for text in bad {
+            match parse_expected_fields(text) {
+                Err(msg) => {
+                    assert!(
+                        msg.contains("--expected-fields"),
+                        "text {text:?}: message must name the option: {msg}"
+                    );
+                    assert!(
+                        msg.contains("array") || msg.contains("string"),
+                        "text {text:?}: message must describe what is required: {msg}"
+                    );
+                }
+                Ok(v) => panic!("text {text:?}: expected rejection, got {v:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn expected_fields_errors_never_echo_the_value() {
+        // Message-bearing content that must not appear in the error text.
+        for (text, secret) in [
+            ("[\"SECRETMARK\"] extra", "SECRETMARK"),
+            ("[SECRETMARK]", "SECRETMARK"),
+            ("null SECRETMARK", "SECRETMARK"),
+            ("[\"a\",\"b\u{0000}\"]", "\u{0000}"),
+        ] {
+            let Err(msg) = parse_expected_fields(text) else {
+                panic!("{text:?} must be rejected");
+            };
+            assert!(!msg.contains(secret), "text {text:?}: error leaked the value: {msg}");
+        }
+    }
+
+    // -- --expected-fields: the combined verify result ----------------------
+
+    fn verify_expected(input: &[u8], key: &str, want: Option<&[&str]>) -> VerifyOutcome {
+        let want = want.map(|items| items.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        super::verify_input(input, key, want.as_deref())
+    }
+
+    #[test]
+    fn expected_fields_matching_record_is_valid() {
+        let key = "00ff";
+        let cases: &[&[&str]] = &[
+            &[],
+            &[""],
+            &["x"],
+            &["hello", "世界", "世界", "", " line 1\nline 2 ", "a=b=c", "--key"],
+        ];
+        for fields in cases {
+            let rec = record_for(key, "id", 1, fields);
+            assert!(
+                matches!(
+                    verify_expected(rec.as_bytes(), key, Some(fields)),
+                    VerifyOutcome::Valid
+                ),
+                "fields {fields:?} must validate against themselves"
+            );
+            // Equivalent JSON spellings of the expectation compare on decoded
+            // text: escapes and layout do not matter.
+            let escaped_json = {
+                let inner = fields
+                    .iter()
+                    .map(|f| format!("\"{}\"", json_escape(f)))
+                    .collect::<Vec<_>>()
+                    .join(" , ");
+                format!(" [ {inner} ]\n")
+            };
+            let parsed = parse_expected_fields(&escaped_json).unwrap();
+            assert!(
+                matches!(
+                    super::verify_input(rec.as_bytes(), key, Some(&parsed)),
+                    VerifyOutcome::Valid
+                ),
+                "fields {fields:?} must validate via escaped expectation"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_fields_differences_are_mismatches_even_though_tag_valid() {
+        let key = "00ff";
+        // (record fields, expected fields) — every record below authenticates
+        // on its own; each expectation differs in content, order or count.
+        let cases: &[(&[&str], &[&str])] = &[
+            (&[], &[""]),                 // zero fields vs one empty field
+            (&[""], &[]),                 // and the reverse
+            (&["x"], &[]),                // one field vs none
+            (&[], &["x"]),                // none vs one
+            (&["x"], &["y"]),             // different content
+            (&["x"], &["x", ""]),         // extra field
+            (&["a", "b"], &["b", "a"]),   // reordered
+            (&["a", "a"], &["a"]),        // collapsed duplicate
+            (&["a"], &["a", "a"]),        // duplicated expectation
+            (&[" x"], &["x"]),            // surrounding whitespace is content
+            (&["x"], &["x "]),
+            (&["a\nb"], &["a", "b"]),     // one newline-bearing field vs two
+            (&["é"], &["e\u{301}"]),      // no Unicode normalization (NFC)
+        ];
+        for (record_fields, want) in cases {
+            let rec = record_for(key, "id", 1, record_fields);
+            assert!(
+                matches!(
+                    verify_expected(rec.as_bytes(), key, Some(want)),
+                    VerifyOutcome::Mismatch
+                ),
+                "record {record_fields:?} must not match expectation {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_fields_stale_tag_on_changed_record_cannot_be_rescued() {
+        let key = "00ff";
+        // Sign a record over ["before"], then change the field in place while
+        // leaving the old tag. The expectation describes the ORIGINAL message
+        // — it must not make the tampered record valid: authentication comes
+        // first.
+        let original = record_for(key, "id", 1, &["before"]);
+        let tampered = original.replace("\"before\"", "\"after\"");
+        assert!(
+            matches!(
+                verify_expected(tampered.as_bytes(), key, Some(&["before"])),
+                VerifyOutcome::Mismatch
+            )
+        );
+        // And describing the tampered content does not help either: the tag
+        // still does not match.
+        assert!(
+            matches!(
+                verify_expected(tampered.as_bytes(), key, Some(&["after"])),
+                VerifyOutcome::Mismatch
+            )
+        );
+
+        // Wrong key is the same uniform mismatch regardless of the expectation.
+        assert!(
+            matches!(
+                verify_expected(original.as_bytes(), "0102", Some(&["before"])),
+                VerifyOutcome::Mismatch
+            )
+        );
+    }
+
+    #[test]
+    fn expected_fields_do_not_change_corruption_classification() {
+        let key = "00ff";
+        // Bad records remain Invalid (exit 2's cause) even when the
+        // expectation itself is fine and matches the would-be fields.
+        let bad: [String; 5] = [
+            String::new(),
+            "   ".to_string(),
+            "{".to_string(),
+            "[]".to_string(),
+            format!("{} junk", record_for(key, "id", 1, &["x"])),
+        ];
+        for bad in bad {
+            assert!(
+                matches!(
+                    verify_expected(bad.as_bytes(), key, Some(&["x"])),
+                    VerifyOutcome::Invalid(_)
+                ),
+                "bad input {bad:?} must stay Invalid with an expectation"
+            );
+        }
+        // Unsupported format/algorithm keep their own reasons.
+        let tag = "a".repeat(64);
+        for rec in [
+            format!("{{\"format\":2,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\"key_version\":1,\"fields\":[],\"tag\":\"{tag}\"}}"),
+            format!("{{\"format\":1,\"algorithm\":\"HMAC-SHA512\",\"key_id\":\"id\",\"key_version\":1,\"fields\":[],\"tag\":\"{tag}\"}}"),
+        ] {
+            match verify_expected(rec.as_bytes(), key, Some(&[])) {
+                VerifyOutcome::Invalid(msg) => assert!(msg.contains("unsupported"), "{msg}"),
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn expected_fields_option_grammar_is_single_use_and_accepts_both_spellings() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        const OPTS: &[options::Spec] = &[
+            options::Spec { name: "--key", multiplicity: options::Multiplicity::Single },
+            options::Spec {
+                name: "--expected-fields",
+                multiplicity: options::Multiplicity::Single,
+            },
+        ];
+        // Both spellings parse, including values starting with "--" and values
+        // containing '='.
+        for ok in [
+            vec!["--key", "00ff", "--expected-fields", "[]"],
+            vec!["--key=00ff", "--expected-fields=[]"],
+            vec!["--key", "00ff", "--expected-fields", "[\"--key\"]"],
+            vec!["--key", "00ff", "--expected-fields=[\"a=b=c\"]"],
+        ] {
+            assert!(options::parse(&args(&ok), OPTS).is_ok(), "{ok:?}");
+        }
+        // Missing value at end of line.
+        assert!(options::parse(
+            &args(&["--key", "00ff", "--expected-fields"]),
+            OPTS
+        )
+        .is_err());
+        // Duplicated across either spelling.
+        assert!(options::parse(
+            &args(&[
+                "--key", "00ff", "--expected-fields", "[]",
+                "--expected-fields", "[]"
+            ]),
+            OPTS
+        )
+        .is_err());
+        assert!(options::parse(
+            &args(&["--key", "00ff", "--expected-fields=[]", "--expected-fields=[]"]),
+            OPTS
+        )
+        .is_err());
     }
 
 }
