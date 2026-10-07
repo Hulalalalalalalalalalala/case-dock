@@ -1291,6 +1291,56 @@ mod tests {
     }
 
     #[test]
+    fn verify_input_requires_valid_utf8_but_accepts_legal_replacement_char() {
+        let key = "00ff";
+        let record = record_for(key, "id", 1, &["左中", "en"]);
+        let insert = |anchor: &str, corrupt: &[u8]| {
+            let pos = record
+                .find(anchor)
+                .map(|p| p + anchor.len())
+                .unwrap_or_else(|| panic!("anchor {anchor:?} must appear in the record"));
+            let mut bytes = record.as_bytes().to_vec();
+            bytes.splice(pos..pos, corrupt.iter().copied());
+            bytes
+        };
+        let mut at_end = record.as_bytes().to_vec();
+        at_end.push(0x80);
+        // Invalid UTF-8 anywhere — inside a field string, inside the key id,
+        // or after the complete object — is corrupt input, never a verdict.
+        let corrupt = [
+            insert("中", b"\x80"),      // isolated continuation byte in a field
+            insert("\"id\"", b"\xc0\xaf"), // overlong encoding in the key id
+            insert("左中", b"\xe4\xb8"), // truncated multibyte before the quote
+            at_end,                     // corrupt byte after the complete object
+        ];
+        for input in corrupt {
+            assert!(std::str::from_utf8(&input).is_err());
+            match verify_input(&input, key) {
+                VerifyOutcome::Invalid(msg) => {
+                    assert!(msg.contains("UTF-8"), "must report the encoding problem: {msg}");
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+
+        // U+FFFD is ordinary legal text: raw or \u-escaped, a record bound to
+        // it verifies; it is not treated as a sign of decoding damage.
+        let fffd = record_for(key, "id", 1, &["左\u{fffd}右"]);
+        assert!(matches!(verify_input(fffd.as_bytes(), key), VerifyOutcome::Valid));
+        let escaped = fffd.replace('\u{fffd}', "\\ufffd");
+        assert!(matches!(verify_input(escaped.as_bytes(), key), VerifyOutcome::Valid));
+
+        // A normal character swapped for a legal U+FFFD with the original tag
+        // kept is a legal record that fails authentication, not corrupt input.
+        let plain = record_for(key, "id", 1, &["左A右"]);
+        let swapped = plain.replacen("\"左A右\"", "\"左\u{fffd}右\"", 1);
+        assert!(matches!(
+            verify_input(swapped.as_bytes(), key),
+            VerifyOutcome::Mismatch
+        ));
+    }
+
+    #[test]
     fn verify_key_version_boundaries_tamper_and_illegal_spellings() {
         let key = "00ff";
         let wrong_key = "0102";
