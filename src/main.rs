@@ -1355,4 +1355,178 @@ mod tests {
         // Distinct decoded names stay distinct, escape spelling or not.
         assert!(parse_single("{\"a\":1,\"\\u0062\":2}").is_ok());
     }
+
+    // -- the complete 32-byte tag: spelling vs. bytes vs. format -----------
+
+    /// Flip exactly one byte (XOR 0x01) of a 64-char hex tag.
+    fn flip_tag_byte(tag: &str, byte_index: usize) -> String {
+        let mut bytes = auth::decode_hex(tag).unwrap();
+        assert_eq!(bytes.len(), 32);
+        bytes[byte_index] ^= 0x01;
+        auth::hex_encode(&bytes)
+    }
+
+    #[test]
+    fn tag_hex_decoding_is_case_insensitive_but_byte_exact() {
+        // A tag known to contain several a-f letters (the tag of a concrete
+        // record) decodes identically in lowercase, uppercase and mixed case.
+        let key = "00ff";
+        let lower = sign_tag(key, "id", 1, &["tag-case"]);
+        assert!(lower.bytes().any(|b| matches!(b, b'a'..=b'f')));
+        let upper = lower.to_uppercase();
+        let mut seen_upper = false;
+        let mixed: String = lower
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 && c.is_ascii_hexdigit() && c.is_ascii_lowercase() {
+                    seen_upper = true;
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        assert!(seen_upper, "mixed spelling must uppercase at least one letter");
+        assert_ne!(mixed, lower);
+        assert_eq!(decode_tag(&lower).unwrap(), decode_tag(&upper).unwrap());
+        assert_eq!(decode_tag(&lower).unwrap(), decode_tag(&mixed).unwrap());
+
+        // Length boundaries: 63 and 65 hex characters are both rejected even
+        // though every character is hexadecimal.
+        assert!(decode_tag(&lower[..63]).is_err());
+        assert!(decode_tag(&lower[1..]).is_err());
+        assert!(decode_tag(&format!("{lower}0")).is_err());
+        assert!(decode_tag(&format!("0{lower}")).is_err());
+        // Character-range boundary: exactly 64 characters but one non-hex
+        // character anywhere is rejected.
+        for pos in [0usize, 31, 63] {
+            let mut bytes = lower.clone().into_bytes();
+            bytes[pos] = b'g';
+            assert!(decode_tag(&String::from_utf8(bytes).unwrap()).is_err());
+        }
+        // The exact 64 lowercase hex chars decode to 32 bytes.
+        assert_eq!(decode_tag(&lower).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn verify_accepts_case_and_unicode_escaped_tag_spellings() {
+        let key = "00ff";
+        let base = record_for(key, "id", 1, &["tag-spelling"]);
+        let tag = sign_tag(key, "id", 1, &["tag-spelling"]);
+
+        // Uppercase and mixed-case spellings decode to the same bytes.
+        let upper = base.replace(&tag, &tag.to_uppercase());
+        let mixed_spelling: String = tag
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 3 == 0 && c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let mixed = base.replace(&tag, &mixed_spelling);
+
+        // Equivalent JSON \u escapes of the tag letters (digits left raw), and
+        // the maximally escaped spelling of the whole tag, still denote the
+        // same decoded string: the tag needs no regeneration.
+        let letters_escaped_spelling: String = tag
+            .chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() {
+                    format!("\\u{:04x}", c as u32)
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        let letters_escaped =
+            base.replace(&format!("\"{tag}\""), &format!("\"{letters_escaped_spelling}\""));
+        let fully_escaped_spelling: String = tag
+            .chars()
+            .map(|c| format!("\\u{:04x}", c as u32))
+            .collect();
+        let fully_escaped =
+            base.replace(&format!("\"{tag}\""), &format!("\"{fully_escaped_spelling}\""));
+
+        for rec in [upper, mixed, letters_escaped, fully_escaped] {
+            assert!(
+                matches!(verify_input(rec.as_bytes(), key), VerifyOutcome::Valid),
+                "equivalent spelling must verify: {rec}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_single_changed_tag_byte_is_a_mismatch_at_every_position() {
+        let key = "00ff";
+        let base = record_for(key, "id", 1, &["tag-bytes"]);
+        let tag = sign_tag(key, "id", 1, &["tag-bytes"]);
+
+        // One tag byte flipped at the start, middle and end, with the message,
+        // key id, version and key untouched: a structurally legal record that
+        // fails authentication. All 31 other bytes being correct is not
+        // enough.
+        for idx in [0usize, 15, 31] {
+            let flipped = flip_tag_byte(&tag, idx);
+            assert_eq!(flipped.len(), tag.len());
+            let rec = base.replace(&tag, &flipped);
+            assert!(
+                matches!(verify_input(rec.as_bytes(), key), VerifyOutcome::Mismatch),
+                "byte {idx} flipped must mismatch"
+            );
+            // Respelling the changed tag in uppercase or via \u escapes
+            // judges the same (changed) bytes and must still mismatch.
+            let rec_upper = base.replace(&tag, &flipped.to_uppercase());
+            assert!(matches!(
+                verify_input(rec_upper.as_bytes(), key),
+                VerifyOutcome::Mismatch
+            ));
+            let escaped: String = flipped
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_lowercase() {
+                        format!("\\u{:04x}", c as u32)
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            let rec_escaped = base.replace(&format!("\"{tag}\""), &format!("\"{escaped}\""));
+            assert!(matches!(
+                verify_input(rec_escaped.as_bytes(), key),
+                VerifyOutcome::Mismatch
+            ));
+        }
+    }
+
+    #[test]
+    fn verify_malformed_tag_lengths_and_chars_are_invalid() {
+        let key = "00ff";
+        let base = record_for(key, "id", 1, &["x"]);
+        let tag = sign_tag(key, "id", 1, &["x"]);
+        let bad_spellings = [
+            tag[..63].to_string(),                    // one character short
+            format!("{tag}f"),                       // one character too many
+            format!("g{}", &tag[1..]),               // non-hex at start
+            format!("{}z{}", &tag[..32], &tag[33..]), // non-hex in middle
+            format!("{}g", &tag[..63]),              // non-hex at end
+        ];
+        for spelling in bad_spellings {
+            let rec = base.replace(&tag, &spelling);
+            match verify_input(rec.as_bytes(), key) {
+                VerifyOutcome::Invalid(msg) => {
+                    let lower = msg.to_lowercase();
+                    assert!(
+                        lower.contains("tag") && lower.contains("hexadecimal"),
+                        "message must describe the tag format problem: {msg}"
+                    );
+                }
+                other => panic!("expected Invalid for malformed tag, got {other:?}"),
+            }
+        }
+    }
 }

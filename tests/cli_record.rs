@@ -3211,3 +3211,456 @@ fn verify_more_than_64_plain_string_fields_verify_normally() {
     assert_eq!(out.stdout, b"{\"valid\":true}\n");
     assert!(out.stderr.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// verify: the complete 32-byte authentication tag
+//
+// Three different situations must stay clearly separated:
+//
+//  1. Equivalent tag *spellings* — the hexadecimal letters written uppercase or
+//     in mixed case, or any tag character written as its equivalent JSON
+//     \uXXXX escape — decode to the same 32 bytes as sign's lowercase output
+//     and must keep the original tag valid. Verification judges the decoded
+//     bytes, never the literal tag string.
+//
+//  2. One changed tag *byte* (at the start, middle or end) leaves the record
+//     structurally legal but breaks authentication: exit 1, one
+//     {"valid":false} line, empty stderr. The other 31 bytes being correct
+//     must not help, and re-casing or escape-respelling the changed tag must
+//     not launder it.
+//
+//  3. A tag with broken *format* — 63 or 65 hex characters, or exactly 64
+//     characters with one non-hex character — is corrupt input: exit 2, empty
+//     stdout, stderr explaining the tag-format problem without echoing the
+//     key, the rejected tag or the whole record.
+//
+// The same accept/reject rules are then pinned against records hand-authored
+// as if produced by another program following only the published format-1
+// contract; their tag is an independent Python golden, never produced by this
+// crate's sign.
+// ---------------------------------------------------------------------------
+
+/// Flip exactly one byte (XOR with 0x01) of a 64-char hex tag and return the
+/// new tag in lowercase hex. The result differs from the input in precisely
+/// one of the 32 authenticated bytes.
+fn tag_with_flipped_byte(tag: &str, byte_index: usize) -> String {
+    assert_eq!(tag.len(), 64, "helper expects a 64-character hex tag");
+    let mut bytes = Vec::with_capacity(32);
+    for i in 0..32 {
+        bytes.push(u8::from_str_radix(&tag[2 * i..2 * i + 2], 16).unwrap());
+    }
+    bytes[byte_index] ^= 0x01;
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Rewrite a hex tag in mixed case: every other hex-letter occurrence is
+/// uppercased, the rest stay lowercase; digits are untouched. With at least
+/// two a-f letters (as every real HMAC tag has) the result contains both
+/// cases while decoding to the identical 32 bytes.
+fn mixed_case_hex(tag: &str) -> String {
+    let mut letter_occurrences = 0;
+    tag.chars()
+        .map(|c| {
+            if c.is_ascii_hexdigit() && c.is_ascii_lowercase() {
+                letter_occurrences += 1;
+                if letter_occurrences % 2 == 1 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Spell every a-f/A-F hex letter of a tag as its JSON `\uXXXX` escape; hex
+/// digits pass through unchanged. After JSON decoding the text is identical
+/// to the input, so the 32 tag bytes do not change.
+fn hex_letters_unicode_escaped(tag: &str) -> String {
+    tag.chars()
+        .map(|c| {
+            if matches!(c, 'a'..='f' | 'A'..='F') {
+                format!("\\u{:04x}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Replace the tag inside a compact signed record body (the quoted 64-char
+/// string following `"tag":`) with an arbitrary raw JSON tag spelling.
+fn replace_tag_spelling(body: &str, original_tag: &str, spelling: &str) -> String {
+    let needle = format!("\"{original_tag}\"");
+    assert_eq!(
+        body.matches(&needle).count(),
+        1,
+        "the quoted tag must appear exactly once"
+    );
+    body.replace(&needle, &format!("\"{spelling}\""))
+}
+
+#[test]
+fn verify_equivalent_tag_spellings_keep_the_original_tag_valid() {
+    let key = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+    let wrong_key = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0c";
+    // Content classes whose verify behavior already has compatibility
+    // guarantees: ordinary multibyte content, the empty message (zero
+    // fields), one empty field, and repeated fields.
+    let records: Vec<Vec<u8>> = vec![
+        sign_record_bytes(key, "demo", "3", &["hello", "世界"]),
+        sign_record_bytes(key, "demo", "3", &[]),
+        sign_record_bytes(key, "demo", "3", &[""]),
+        sign_record_bytes(key, "demo", "3", &["x", "x"]),
+    ];
+
+    for record in &records {
+        let body = String::from_utf8(record.clone()).unwrap();
+        let tag = Json::parse(body.trim_end_matches('\n'))
+            .get("tag")
+            .as_str()
+            .to_string();
+        assert_eq!(tag.len(), 64);
+
+        // (1) Every hex letter uppercase.
+        let upper = body.replace(&tag, &tag.to_uppercase());
+        // (2) Mixed case: same 32 bytes, but neither sign's lowercase spelling
+        // nor the all-caps spelling.
+        let mixed = mixed_case_hex(&tag);
+        assert_ne!(mixed, tag, "mixed-case spelling must differ on the wire");
+        assert!(mixed.bytes().any(|b| b.is_ascii_uppercase()));
+        let mixed_rec = body.replace(&tag, &mixed);
+        // (3) The a-f letters written as JSON \u escapes, digits kept raw.
+        let letters_escaped = hex_letters_unicode_escaped(&tag);
+        assert!(letters_escaped.contains("\\u"));
+        let letters_rec = replace_tag_spelling(&body, &tag, &letters_escaped);
+        // (4) Every tag character written as a \u escape: pure ASCII on the
+        // wire, for both the lowercase and uppercase spellings (case change
+        // and escapes combined).
+        let fully_escaped = escape_every_char(&tag);
+        let fully_escaped_upper = escape_every_char(&tag.to_uppercase());
+        assert!(fully_escaped.is_ascii() && fully_escaped_upper.is_ascii());
+        let fully_rec = body.replace(&format!("\"{tag}\""), &fully_escaped);
+        let fully_upper_rec =
+            body.replace(&format!("\"{tag}\""), &fully_escaped_upper);
+        // (5) Mixed-case spelling whose letters are then \u-escaped.
+        let mixed_escaped = hex_letters_unicode_escaped(&mixed);
+        let mixed_escaped_rec = replace_tag_spelling(&body, &tag, &mixed_escaped);
+
+        let variants = [
+            ("uppercase", upper),
+            ("mixed case", mixed_rec),
+            ("letters unicode-escaped", letters_rec),
+            ("fully unicode-escaped", fully_rec),
+            ("fully escaped uppercase", fully_upper_rec),
+            ("mixed case then escaped", mixed_escaped_rec),
+        ];
+        for (label, text) in variants {
+            assert_ne!(text, body, "{label}: respelling must change the wire text");
+            let out = run_verify(key, text.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{label}: stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"{\"valid\":true}\n", "{label}");
+            assert!(out.stderr.is_empty(), "{label}: stderr must be empty");
+        }
+    }
+
+    // The respelling does not authenticate anything by itself: an
+    // equivalent-spelling record under the wrong key is still a mismatch,
+    // proving the positive cases above judge the decoded bytes rather than
+    // accepting on wording.
+    let body = String::from_utf8(records[0].clone()).unwrap();
+    let tag = Json::parse(body.trim_end_matches('\n'))
+        .get("tag")
+        .as_str()
+        .to_string();
+    let upper = body.replace(&tag, &tag.to_uppercase());
+    let out = run_verify(wrong_key, upper.as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_one_changed_tag_byte_at_start_middle_or_end_is_a_mismatch() {
+    let key = "00ff";
+    let record = sign_record_bytes(key, "id", "1", &["auth-boundary-测试"]);
+    let body = String::from_utf8(record).unwrap();
+    let tag = Json::parse(body.trim_end_matches('\n'))
+        .get("tag")
+        .as_str()
+        .to_string();
+
+    // Message, key id, key version and key stay exactly as signed; only one
+    // tag byte moves, at the beginning, in the middle and at the end. All 31
+    // other bytes remain correct.
+    for (where_label, idx) in [("start", 0usize), ("middle", 15), ("end", 31)] {
+        let flipped = tag_with_flipped_byte(&tag, idx);
+        assert_ne!(flipped, tag);
+
+        // Changing the byte's case or escape-spelling cannot hide the change:
+        // every spelling below decodes to the same flipped 32 bytes and must
+        // be a plain mismatch (exit 1), never valid and never corrupt input.
+        let upper = flipped.to_uppercase();
+        let mixed = mixed_case_hex(&flipped);
+        let letters_escaped = hex_letters_unicode_escaped(&flipped);
+        let spellings = [
+            ("lowercase", flipped.as_str()),
+            ("uppercase", upper.as_str()),
+            ("mixed case", mixed.as_str()),
+            ("letters escaped", letters_escaped.as_str()),
+        ];
+        for (spelling, tag_text) in spellings {
+            let rec = replace_tag_spelling(&body, &tag, tag_text);
+            let out = run_verify(key, rec.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{where_label}/{spelling}: expected mismatch, stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"{\"valid\":false}\n", "{where_label}/{spelling}");
+            assert!(
+                out.stderr.is_empty(),
+                "{where_label}/{spelling}: mismatch must be silent on stderr"
+            );
+        }
+    }
+}
+
+#[test]
+fn verify_malformed_tag_spellings_are_corrupt_input() {
+    // Distinctive sentinels: none may appear in any error message.
+    let key = "c0dec0dec0de";
+    let key_id = "tagformat-probe";
+    let field = "SENTINEL_TAG_FIELD";
+    let record = sign_record_bytes(key, key_id, "1", &[field]);
+    let body = String::from_utf8(record).unwrap();
+    let tag = Json::parse(body.trim_end_matches('\n'))
+        .get("tag")
+        .as_str()
+        .to_string();
+
+    // Length boundary with every character legal hex: both odd lengths 63 and
+    // 65 (one below and one above the 64-character tag) are corrupt.
+    let drop_last = tag[..63].to_string();
+    let drop_first = tag[1..].to_string();
+    let append = format!("{tag}0");
+    let prepend = format!("0{tag}");
+
+    // Character-range boundary: exactly 64 characters but one non-hex
+    // character, placed at the start, the middle and the end.
+    let nonhex_at = |pos: usize, ch: u8| -> String {
+        let mut bytes = tag.clone().into_bytes();
+        bytes[pos] = ch;
+        String::from_utf8(bytes).unwrap()
+    };
+    let nonhex_start = nonhex_at(0, b'g');
+    let nonhex_middle = nonhex_at(31, b'z');
+    let nonhex_end = nonhex_at(63, b'@');
+
+    let cases = [
+        ("63 hex chars (last dropped)", drop_last),
+        ("63 hex chars (first dropped)", drop_first),
+        ("65 hex chars (appended)", append),
+        ("65 hex chars (prepended)", prepend),
+        ("64 chars, non-hex at start", nonhex_start),
+        ("64 chars, non-hex in middle", nonhex_middle),
+        ("64 chars, non-hex at end", nonhex_end),
+    ];
+    for (label, bad_tag) in cases {
+        let rec = replace_tag_spelling(&body, &tag, &bad_tag);
+        let out = run_verify(key, rec.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{label}: expected exit 2, stdout={:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(out.stdout.is_empty(), "{label}: stdout must be empty on exit 2");
+        let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+        assert!(!stderr.trim().is_empty(), "{label}: stderr must explain the problem");
+        let lower = stderr.to_lowercase();
+        assert!(
+            lower.contains("tag") && lower.contains("hexadecimal"),
+            "{label}: stderr must describe the tag format problem: {stderr}"
+        );
+        // The error must not echo the key, the rejected tag, the original tag,
+        // any record content, or the whole record.
+        assert!(!stderr.contains(key), "{label}: stderr echoed the key: {stderr}");
+        assert!(!stderr.contains(key_id), "{label}: stderr echoed key id: {stderr}");
+        assert!(!stderr.contains(field), "{label}: stderr echoed a field: {stderr}");
+        assert!(!stderr.contains(&tag), "{label}: stderr echoed the original tag: {stderr}");
+        assert!(!stderr.contains(&bad_tag), "{label}: stderr echoed the rejected tag: {stderr}");
+        assert!(!stderr.contains(&rec), "{label}: stderr echoed the whole record: {stderr}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External producer: records another program generated from the published
+// format-1 contract alone (sign is never invoked for their tag). The golden
+// below was computed independently with Python's hmac/hashlib/struct over the
+// byte recipe in README.md and cross-checked against a second, hand-written
+// RFC 2104 HMAC construction:
+//
+//   key        a1b2c3d4e5f60718293a4b5c6d7e8f90
+//   key_id     "ext-tag-probe"
+//   version    9
+//   fields     ["tag-auth-边界", "dup", "dup", ""]   (multibyte, duplicate, empty)
+//
+// The accepted and rejected tag spellings must behave exactly like records
+// authnote produced itself.
+// ---------------------------------------------------------------------------
+
+const TP_KEY: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+const TP_KID: &str = "ext-tag-probe";
+const TP_FIELD_MULTIBYTE: &str = "tag-auth-边界";
+/// Independent Python golden tag for the content above.
+const TP_TAG: &str = "2d286f0d6bd3ab12b4a08cc6c4f486ad8a67be673fa5f9d0026a239ba5ee1d54";
+/// The golden with byte 0 flipped (XOR 0x01).
+const TP_TAG_FLIP_START: &str =
+    "2c286f0d6bd3ab12b4a08cc6c4f486ad8a67be673fa5f9d0026a239ba5ee1d54";
+/// The golden with byte 15 (middle) flipped.
+const TP_TAG_FLIP_MIDDLE: &str =
+    "2d286f0d6bd3ab12b4a08cc6c4f486ac8a67be673fa5f9d0026a239ba5ee1d54";
+/// The golden with byte 31 (last) flipped.
+const TP_TAG_FLIP_END: &str =
+    "2d286f0d6bd3ab12b4a08cc6c4f486ad8a67be673fa5f9d0026a239ba5ee1d55";
+
+/// Hand-author an external format-1 record with an arbitrary raw tag spelling.
+fn tp_record(tag_spelling: &str) -> String {
+    format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"{TP_KID}\",\"key_version\":9,\"fields\":[\"{TP_FIELD_MULTIBYTE}\",\"dup\",\"dup\",\"\"],\"tag\":\"{tag_spelling}\"}}"
+    )
+}
+
+#[test]
+fn external_records_accept_equivalent_tag_spellings_like_authnote_records() {
+    // The mechanical flip helper must reproduce the independently derived
+    // flipped golden constants, so the mismatch cases are Python-anchored
+    // rather than derived from the helper under test.
+    assert_eq!(tag_with_flipped_byte(TP_TAG, 0), TP_TAG_FLIP_START);
+    assert_eq!(tag_with_flipped_byte(TP_TAG, 15), TP_TAG_FLIP_MIDDLE);
+    assert_eq!(tag_with_flipped_byte(TP_TAG, 31), TP_TAG_FLIP_END);
+
+    // Acceptance: every spelling decodes to the golden's 32 bytes, no tag
+    // regeneration required.
+    let upper = TP_TAG.to_uppercase();
+    let mixed = mixed_case_hex(TP_TAG);
+    let letters_escaped = hex_letters_unicode_escaped(TP_TAG);
+    let fully_escaped = escape_every_char(TP_TAG);
+    let fully_escaped_upper = escape_every_char(&upper);
+    assert!(fully_escaped.is_ascii() && fully_escaped_upper.is_ascii());
+    let mixed_escaped = hex_letters_unicode_escaped(&mixed);
+    let accepted = [
+        ("python golden lowercase", TP_TAG.to_string()),
+        ("uppercase", upper),
+        ("mixed case", mixed),
+        ("letters unicode-escaped", letters_escaped),
+        ("fully unicode-escaped", fully_escaped.trim_matches('"').to_string()),
+        ("fully escaped uppercase", fully_escaped_upper.trim_matches('"').to_string()),
+        ("mixed case then escaped", mixed_escaped),
+    ];
+    for (label, spelling) in accepted {
+        let rec = tp_record(&spelling);
+        let out = run_verify(TP_KEY, rec.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{label}: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}: stderr must be empty");
+    }
+
+    // A reordered, pretty-printed external record with an escaped uppercase
+    // tag verifies just the same: spelling and layout carry no authority.
+    let pretty = format!(
+        "  {{\n    \"tag\" : {fully_escaped_upper},\n    \"fields\" : [ \"{TP_FIELD_MULTIBYTE}\", \"dup\", \"dup\", \"\" ],\n    \"key_version\" : 9,\n    \"key_id\" : \"{TP_KID}\",\n    \"algorithm\" : \"HMAC-SHA256\",\n    \"format\" : 1\n  }}\r\n"
+    );
+    let out = run_verify(TP_KEY, pretty.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+
+    // Non-vacuousness: the very same golden spelling under a different key is
+    // a plain mismatch, following the same rule as authnote-produced records.
+    let out = run_verify("a1b2c3d4e5f60718293a4b5c6d7e8f91", tp_record(TP_TAG).as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn external_records_reject_changed_and_malformed_tags_like_authnote_records() {
+    // One changed tag byte at the start, middle or end — each independently
+    // Python-derived — is a structurally legal record that fails
+    // authentication, in lowercase and when respelled uppercase/mixed/escaped.
+    for (where_label, flipped) in [
+        ("start", TP_TAG_FLIP_START),
+        ("middle", TP_TAG_FLIP_MIDDLE),
+        ("end", TP_TAG_FLIP_END),
+    ] {
+        let upper = flipped.to_uppercase();
+        let mixed = mixed_case_hex(flipped);
+        let escaped = hex_letters_unicode_escaped(flipped);
+        for (spelling, tag_text) in [
+            ("lowercase", flipped),
+            ("uppercase", &upper),
+            ("mixed case", &mixed),
+            ("letters escaped", &escaped),
+        ] {
+            let rec = tp_record(tag_text);
+            let out = run_verify(TP_KEY, rec.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{where_label}/{spelling}: expected mismatch, stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"{\"valid\":false}\n");
+            assert!(out.stderr.is_empty(), "{where_label}/{spelling}: mismatch must be silent");
+        }
+    }
+
+    // Malformed tag formats on otherwise-correct external records are corrupt
+    // input: exit 2, empty stdout, a tag-format explanation, and no echo of
+    // the key, the rejected tag, record content or the whole record.
+    let bad_tags = [
+        ("63 hex chars", TP_TAG[..63].to_string()),
+        ("65 hex chars", format!("{TP_TAG}f")),
+        ("64 chars non-hex at start", format!("g{}", &TP_TAG[1..])),
+        ("64 chars non-hex in middle", {
+            let mut b = TP_TAG.to_string();
+            b.replace_range(30..31, "G");
+            b
+        }),
+        ("64 chars non-hex at end", format!("{}g", &TP_TAG[..63])),
+    ];
+    for (label, bad_tag) in bad_tags {
+        let rec = tp_record(&bad_tag);
+        let out = run_verify(TP_KEY, rec.as_bytes());
+        assert_eq!(out.status.code(), Some(2), "{label}: expected exit 2");
+        assert!(out.stdout.is_empty(), "{label}: stdout must be empty");
+        let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+        assert!(!stderr.trim().is_empty(), "{label}: stderr must explain the problem");
+        let lower = stderr.to_lowercase();
+        assert!(
+            lower.contains("tag") && lower.contains("hexadecimal"),
+            "{label}: stderr must describe the tag format problem: {stderr}"
+        );
+        assert!(!stderr.contains(TP_KEY), "{label}: stderr echoed the key: {stderr}");
+        assert!(!stderr.contains(TP_KID), "{label}: stderr echoed key id: {stderr}");
+        assert!(!stderr.contains(TP_FIELD_MULTIBYTE), "{label}: stderr echoed a field: {stderr}");
+        assert!(!stderr.contains(TP_TAG), "{label}: stderr echoed the golden tag: {stderr}");
+        assert!(!stderr.contains(&bad_tag), "{label}: stderr echoed the rejected tag: {stderr}");
+        assert!(!stderr.contains(&rec), "{label}: stderr echoed the whole record: {stderr}");
+    }
+}
