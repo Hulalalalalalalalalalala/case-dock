@@ -768,6 +768,249 @@ fn verify_option_errors_match_sign_and_never_echo_secrets() {
     assert!(!stderr.contains(secret), "stderr echoed the key: {stderr}");
 }
 
+// ---------------------------------------------------------------------------
+// verify: --expected-fields (cross-check the record against a held message)
+// ---------------------------------------------------------------------------
+
+/// Assert a verify run reports the one-line authenticity result: exit 0/1,
+/// exactly the documented stdout line and an empty stderr.
+fn expect_verify_verdict(input: &[u8], args: &[&str], valid: bool) {
+    let out = run_verify_raw(args, input);
+    let code = if valid { 0 } else { 1 };
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "expected exit {code}, stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = if valid {
+        b"{\"valid\":true}\n".as_slice()
+    } else {
+        b"{\"valid\":false}\n".as_slice()
+    };
+    assert_eq!(out.stdout, body);
+    assert!(
+        out.stderr.is_empty(),
+        "stderr must be empty, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn verify_expected_fields_matching_message_exit_0() {
+    let key = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+    let record = sign_record_bytes(key, "demo", "3", &["hello", "世界", "hello"]);
+
+    // Space form and equals form are equivalent for this option too.
+    expect_verify_verdict(
+        &record,
+        &["--key", key, "--expected-fields", "[\"hello\",\"世界\",\"hello\"]"],
+        true,
+    );
+    expect_verify_verdict(
+        &record,
+        &["--key", key, "--expected-fields=[\"hello\",\"世界\",\"hello\"]"],
+        true,
+    );
+    // Order of the two options is free, and the two option spellings mix.
+    expect_verify_verdict(
+        &record,
+        &["--expected-fields=[\"hello\",\"世界\",\"hello\"]", "--key", key],
+        true,
+    );
+    // The expectation is itself JSON: surrounding whitespace, reformatting
+    // and equivalent escape spellings do not change the decoded message.
+    expect_verify_verdict(
+        &record,
+        &[
+            "--key",
+            key,
+            "--expected-fields",
+            "  [\n \"hello\", \"\\u4e16\\u754c\", \"hello\" ]\t ",
+        ],
+        true,
+    );
+    // Equals signs inside the value survive (the split is at the first '=').
+    let rec_eq = sign_record_bytes(key, "demo", "3", &["a=b=c"]);
+    expect_verify_verdict(
+        &rec_eq,
+        &["--key", key, "--expected-fields=[\"a=b=c\"]"],
+        true,
+    );
+
+    // Zero fields vs one empty field each match only themselves.
+    let zero = sign_record_bytes(key, "id", "1", &[]);
+    let one_empty = sign_record_bytes(key, "id", "1", &[""]);
+    expect_verify_verdict(&zero, &["--key", key, "--expected-fields", "[]"], true);
+    expect_verify_verdict(
+        &one_empty,
+        &["--key", key, "--expected-fields", "[\"\"]"],
+        true,
+    );
+}
+
+#[test]
+fn verify_expected_fields_differences_exit_1_with_empty_stderr() {
+    let key = "00ff";
+    let record = sign_record_bytes(key, "id", "1", &["a", "b"]);
+
+    // Content, order and count each give the same uninformative mismatch.
+    for expectation in [
+        "[\"a\",\"c\"]",
+        "[\"b\",\"a\"]",
+        "[\"a\"]",
+        "[\"a\",\"b\",\"c\"]",
+        "[\" a\",\"b\"]",
+        "[\"a\\u00e9\",\"b\"]",
+    ] {
+        expect_verify_verdict(
+            &record,
+            &["--key", key, "--expected-fields", expectation],
+            false,
+        );
+    }
+
+    // [] and [""] cannot satisfy one another in either direction.
+    let zero = sign_record_bytes(key, "id", "1", &[]);
+    let one_empty = sign_record_bytes(key, "id", "1", &[""]);
+    expect_verify_verdict(
+        &zero,
+        &["--key", key, "--expected-fields", "[\"\"]"],
+        false,
+    );
+    expect_verify_verdict(
+        &one_empty,
+        &["--key", key, "--expected-fields", "[]"],
+        false,
+    );
+
+    // A wrong key is the same verdict even though every expected field lines
+    // up: authenticity and agreement are both required.
+    expect_verify_verdict(
+        &record,
+        &["--key", "0102", "--expected-fields", "[\"a\",\"b\"]"],
+        false,
+    );
+}
+
+#[test]
+fn verify_expected_fields_do_not_authorize_a_tampered_record() {
+    // Change a field but keep the original tag: an expectation describing the
+    // pre-change message (or even the post-change one) must not pass — the
+    // record itself no longer authenticates.
+    let key = "00ff";
+    let record = sign_record_bytes(key, "id", "1", &["a", "b"]);
+    let body = std::str::from_utf8(&record).unwrap();
+    let tampered = body.replace("\"a\"", "\"c\"");
+    assert_ne!(tampered, body);
+
+    expect_verify_verdict(
+        tampered.as_bytes(),
+        &["--key", key, "--expected-fields", "[\"a\",\"b\"]"],
+        false,
+    );
+    expect_verify_verdict(
+        tampered.as_bytes(),
+        &["--key", key, "--expected-fields", "[\"c\",\"b\"]"],
+        false,
+    );
+}
+
+#[test]
+fn verify_expected_fields_record_errors_stay_exit_2() {
+    // A structurally bad record keeps its own error convention regardless of
+    // the expectation; field disagreement never downgrades that to exit 1.
+    let key = "00ff";
+    let rec = sign_record_bytes(key, "id", "1", &["x"]);
+
+    let mut trailing = rec.clone();
+    trailing.extend_from_slice(b" junk");
+    for input in [&b"{"[..], &b"[]"[..], trailing.as_slice()] {
+        expect_verify_invalid(input, &["--key", key, "--expected-fields", "[\"x\"]"]);
+        expect_verify_invalid(input, &["--key", key, "--expected-fields", "[]"]);
+    }
+
+    // An unsupported format version is still reported explicitly (exit 2),
+    // not as either verdict.
+    let tag = "a".repeat(64);
+    let v2 = format!(
+        "{{\"format\":2,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\"key_version\":1,\"fields\":[],\"tag\":\"{tag}\"}}"
+    );
+    expect_verify_invalid(v2.as_bytes(), &["--key", key, "--expected-fields", "[]"]);
+}
+
+#[test]
+fn verify_expected_fields_option_errors_exit_2_and_never_echo_value() {
+    let key = "00ff";
+    let rec = sign_record_bytes(key, "id", "1", &["x"]);
+
+    // Missing value: last argument with nothing following, and empty '=' form.
+    expect_verify_invalid(&rec, &["--key", key, "--expected-fields"]);
+    expect_verify_invalid(&rec, &["--key", key, "--expected-fields="]);
+
+    // Repeated, across the two spellings.
+    expect_verify_invalid(
+        &rec,
+        &[
+            "--key",
+            key,
+            "--expected-fields",
+            "[\"x\"]",
+            "--expected-fields",
+            "[\"x\"]",
+        ],
+    );
+    expect_verify_invalid(
+        &rec,
+        &[
+            "--key",
+            key,
+            "--expected-fields=[\"x\"]",
+            "--expected-fields=[\"x\"]",
+        ],
+    );
+
+    // Every malformed/non-array shape: null, other JSON types, corruption,
+    // trailing content, non-string elements.
+    let bad: &[&str] = &[
+        "null",
+        "true",
+        "42",
+        "\"not an array\"",
+        "{}",
+        "",
+        "   ",
+        "[",
+        "[\"x\"",
+        "[\"x\",]",
+        "[] []",
+        "[]x",
+        "[1]",
+        "[\"x\",null]",
+        "[[\"x\"]]",
+    ];
+    for value in bad {
+        let stderr =
+            expect_verify_invalid(&rec, &["--key", key, "--expected-fields", value]);
+        assert!(
+            stderr.contains("--expected-fields"),
+            "value {value:?}: stderr must name the option: {stderr}"
+        );
+    }
+
+    // The rejected JSON text is never echoed back.
+    let secret = "SECRET-EXPECTATION-8214";
+    let stderr = expect_verify_invalid(
+        &rec,
+        &["--key", key, "--expected-fields", &format!("[\"{secret}\"] junk")],
+    );
+    assert!(
+        !stderr.contains(secret),
+        "stderr echoed the rejected expectation: {stderr}"
+    );
+}
+
 
 // ---------------------------------------------------------------------------
 // Minimal JSON parser (objects, arrays, strings, integers, true/false/null).

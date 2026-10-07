@@ -168,10 +168,8 @@ fn main() -> ExitCode {
         Some("verify") => verify(&args[1..]),
         _ => {
             eprintln!("Usage: authnote --version");
-            eprintln!(
-                "       authnote sign --key HEX --key-id ID --key-version N [--field TEXT]..."
-            );
-            eprintln!("       authnote verify --key HEX");
+            eprintln!("       authnote sign --key HEX --key-id ID --key-version N [--field TEXT]...");
+            eprintln!("       authnote verify --key HEX [--expected-fields JSON]");
             ExitCode::from(2)
         }
     }
@@ -449,29 +447,50 @@ fn validate_sign_args(opts: RawSignOptions) -> Result<SignOptions, String> {
 // ---------------------------------------------------------------------------
 
 fn verify(args: &[String]) -> ExitCode {
-    // verify deliberately shares sign's option grammar through the common
-    // parser but declares its own, narrower table: --key is the only known
-    // option, so every sign-only option (--key-id, --key-version, --field)
-    // is rejected here as unrecognized. Values that fail are never echoed
-    // (they could be a mistyped secret).
-    const VERIFY_OPTIONS: &[options::Spec] = &[options::Spec {
-        name: "--key",
-        multiplicity: options::Multiplicity::Single,
-    }];
+    // verify shares sign's option grammar through the common parser. Its
+    // table is its own: --key (required, single use) plus the optional,
+    // single-use --expected-fields; every sign-only option (--key-id,
+    // --key-version, --field) stays rejected here as unrecognized. Values
+    // that fail are never echoed (they could be a mistyped secret).
+    const VERIFY_OPTIONS: &[options::Spec] = &[
+        options::Spec {
+            name: "--key",
+            multiplicity: options::Multiplicity::Single,
+        },
+        options::Spec {
+            name: "--expected-fields",
+            multiplicity: options::Multiplicity::Single,
+        },
+    ];
+    const VERIFY_KEY_INDEX: usize = 0;
+    const VERIFY_EXPECTED_INDEX: usize = 1;
 
-    let parse = (|| -> Result<String, String> {
+    let parsed = (|| -> Result<(String, Option<Vec<String>>), String> {
         let occurrences = options::parse(args, VERIFY_OPTIONS)?;
-        // The parser enforces "at most one --key"; take it if present.
-        let key = occurrences
-            .first()
-            .map(|o| o.value.clone())
-            .ok_or("missing required option --key")?;
+        // The parser enforces "at most once" for each single-use option.
+        let mut key: Option<String> = None;
+        let mut expected_text: Option<String> = None;
+        for occurrence in occurrences {
+            match occurrence.spec_index {
+                VERIFY_KEY_INDEX => key = Some(occurrence.value),
+                VERIFY_EXPECTED_INDEX => expected_text = Some(occurrence.value),
+                _ => unreachable!("verify declares only two options"),
+            }
+        }
+        let key = key.ok_or("missing required option --key")?;
         auth::validate_key_hex(&key)?;
-        Ok(key)
+        // An absent option means "authenticate the record only"; a present one
+        // must be exactly one JSON array of strings, decoded before reading the
+        // record so a bad expectation is a usage error either way.
+        let expected_fields = match expected_text {
+            Some(text) => Some(parse_expected_fields(&text)?),
+            None => None,
+        };
+        Ok((key, expected_fields))
     })();
 
-    let key_hex = match parse {
-        Ok(key) => key,
+    let (key_hex, expected_fields) = match parsed {
+        Ok(parsed) => parsed,
         Err(msg) => {
             eprintln!("authnote verify: {msg}");
             return ExitCode::from(2);
@@ -486,7 +505,7 @@ fn verify(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let outcome = verify_input(&input, &key_hex);
+    let outcome = verify_input(&input, &key_hex, expected_fields.as_deref());
     match outcome {
         VerifyOutcome::Valid => {
             println!("{{\"valid\":true}}");
@@ -503,6 +522,40 @@ fn verify(args: &[String]) -> ExitCode {
     }
 }
 
+/// Parse the value of verify's `--expected-fields`: exactly one complete JSON
+/// value that is an array whose every element is a string.
+///
+/// Surrounding JSON whitespace is allowed (like the record framing), but
+/// trailing content, a non-array value or any non-string element are usage
+/// errors. Comparison later happens on the *decoded* text, so formatting and
+/// equivalent escape spellings never matter while whitespace, empty strings,
+/// repeats and order are all preserved exactly. The rejected JSON text itself
+/// is never quoted back: it travels on a command line and could contain
+/// anything.
+fn parse_expected_fields(text: &str) -> Result<Vec<String>, String> {
+    let value = json::parse_single(text).map_err(|e| {
+        format!("option --expected-fields must be one JSON array of strings: {e}")
+    })?;
+    match value {
+        json::JsonValue::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    json::JsonValue::String(s) => out.push(s),
+                    _ => {
+                        return Err(
+                            "option --expected-fields must be a JSON array containing only strings"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => Err("option --expected-fields must be a JSON array of strings".to_string()),
+    }
+}
+
 #[derive(Debug)]
 enum VerifyOutcome {
     Valid,
@@ -510,7 +563,20 @@ enum VerifyOutcome {
     Invalid(String),
 }
 
-fn verify_input(input: &[u8], key_hex: &str) -> VerifyOutcome {
+/// Verify one record read from `input`.
+///
+/// `expected_fields` is the independently-held message the caller wants the
+/// record checked against: `None` authenticates the record alone (the existing
+/// behavior); `Some` additionally requires the record's fields to equal the
+/// expectation item by item. The order of the two checks is fixed — the tag is
+/// recomputed and matched first, so tampered fields with a stale tag look
+/// exactly like a wrong key: a plain mismatch, never a success against the
+/// pre-tamper message. Field count, order and exact decoded text must all
+/// agree; `[]` (zero fields) and `[""]` (one empty field) never compare equal.
+/// Structural problems with the record remain the caller's own error
+/// (`Invalid`, exit 2): a different expectation never turns a corrupt record
+/// into an authentication mismatch.
+fn verify_input(input: &[u8], key_hex: &str, expected_fields: Option<&[String]>) -> VerifyOutcome {
     let text = match std::str::from_utf8(input) {
         Ok(t) => t,
         // Still parse to distinguish a structurally invalid record from a
@@ -536,10 +602,17 @@ fn verify_input(input: &[u8], key_hex: &str) -> VerifyOutcome {
         &record.fields,
     );
 
-    if auth::tags_match(&expected_tag, &record.tag) {
-        VerifyOutcome::Valid
-    } else {
-        VerifyOutcome::Mismatch
+    if !auth::tags_match(&expected_tag, &record.tag) {
+        return VerifyOutcome::Mismatch;
+    }
+
+    // The record is authentic. Only now may the independently-held message be
+    // compared, on decoded text with count and order significant. A mismatch of
+    // content is reported through the same uninformative result as a wrong key
+    // so the two causes cannot be distinguished from outside.
+    match expected_fields {
+        Some(expected) if expected != record.fields.as_slice() => VerifyOutcome::Mismatch,
+        _ => VerifyOutcome::Valid,
     }
 }
 
@@ -1185,23 +1258,23 @@ mod tests {
         let key = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
         // Zero fields vs one empty field are both valid and distinct.
         assert!(matches!(
-            verify_input(record_for(key, "id", 1, &[]).as_bytes(), key),
+            verify_input(record_for(key, "id", 1, &[]).as_bytes(), key, None),
             VerifyOutcome::Valid
         ));
         assert!(matches!(
-            verify_input(record_for(key, "id", 1, &[""]).as_bytes(), key),
+            verify_input(record_for(key, "id", 1, &[""]).as_bytes(), key, None),
             VerifyOutcome::Valid
         ));
         // Unicode, duplicate and reordered fields.
         let rec = record_for(key, "demo", 3, &["hello", "世界", "世界"]);
-        assert!(matches!(verify_input(rec.as_bytes(), key), VerifyOutcome::Valid));
+        assert!(matches!(verify_input(rec.as_bytes(), key, None), VerifyOutcome::Valid));
         // Surrounding JSON whitespace and internal reformatting are fine.
         let pretty = format!(
             " \n\t{}  \r\n",
             rec.replace(',', ",\n  ").replace('{', "{\n  ")
         );
         assert!(matches!(
-            verify_input(pretty.as_bytes(), key),
+            verify_input(pretty.as_bytes(), key, None),
             VerifyOutcome::Valid
         ));
         // Member order must not matter.
@@ -1212,14 +1285,14 @@ mod tests {
         let tag = sign_tag(key, "id", 1, &[]);
         reordered = reordered.replace('X', &tag);
         assert!(matches!(
-            verify_input(reordered.as_bytes(), key),
+            verify_input(reordered.as_bytes(), key, None),
             VerifyOutcome::Valid
         ));
         // Uppercase tag spelling still represents the same 32 bytes.
         let real_tag = sign_tag(key, "id", 1, &["x"]);
         let upper = record_for(key, "id", 1, &["x"]).replace(&real_tag, &real_tag.to_uppercase());
         assert!(matches!(
-            verify_input(upper.as_bytes(), key),
+            verify_input(upper.as_bytes(), key, None),
             VerifyOutcome::Valid
         ));
     }
@@ -1229,7 +1302,7 @@ mod tests {
         let key = "00ff";
         let base = record_for(key, "id", 1, &["x"]);
         assert!(matches!(
-            verify_input(base.as_bytes(), "ff00"),
+            verify_input(base.as_bytes(), "ff00", None),
             VerifyOutcome::Mismatch
         ));
 
@@ -1243,7 +1316,7 @@ mod tests {
         ];
         for rec in tampered {
             assert!(
-                matches!(verify_input(rec.as_bytes(), key), VerifyOutcome::Mismatch),
+                matches!(verify_input(rec.as_bytes(), key, None), VerifyOutcome::Mismatch),
                 "expected mismatch for {rec}"
             );
         }
@@ -1284,7 +1357,7 @@ mod tests {
         ];
         for rec in invalid {
             assert!(
-                matches!(verify_input(rec.as_bytes(), key), VerifyOutcome::Invalid(_)),
+                matches!(verify_input(rec.as_bytes(), key, None), VerifyOutcome::Invalid(_)),
                 "expected Invalid for {rec:?}"
             );
         }
@@ -1301,11 +1374,11 @@ mod tests {
         for version in [1u32, 4294967295] {
             let rec = record_for(key, "id", version, &["x"]);
             assert!(
-                matches!(verify_input(rec.as_bytes(), key), VerifyOutcome::Valid),
+                matches!(verify_input(rec.as_bytes(), key, None), VerifyOutcome::Valid),
                 "version {version} must verify with the correct key"
             );
             assert!(
-                matches!(verify_input(rec.as_bytes(), wrong_key), VerifyOutcome::Mismatch),
+                matches!(verify_input(rec.as_bytes(), wrong_key, None), VerifyOutcome::Mismatch),
                 "version {version} under a wrong key is a mismatch"
             );
         }
@@ -1324,7 +1397,7 @@ mod tests {
         for rec in tampered {
             for k in [key, wrong_key] {
                 assert!(
-                    matches!(verify_input(rec.as_bytes(), k), VerifyOutcome::Mismatch),
+                    matches!(verify_input(rec.as_bytes(), k, None), VerifyOutcome::Mismatch),
                     "expected mismatch for {rec}"
                 );
             }
@@ -1352,7 +1425,7 @@ mod tests {
         ];
         for token in illegal {
             for k in [key, wrong_key] {
-                match verify_input(raw_record(token).as_bytes(), k) {
+                match verify_input(raw_record(token).as_bytes(), k, None) {
                     VerifyOutcome::Invalid(msg) => {
                         let lower = msg.to_lowercase();
                         assert!(
@@ -1371,7 +1444,7 @@ mod tests {
         // intact (a tampered in-range version is still just a mismatch).
         let spaced = v1.replace("\"key_version\":1", "\"key_version\" : 2 ");
         assert!(matches!(
-            verify_input(spaced.as_bytes(), key),
+            verify_input(spaced.as_bytes(), key, None),
             VerifyOutcome::Mismatch
         ));
     }
@@ -1387,7 +1460,7 @@ mod tests {
             "{{\"format\":1,\"algorithm\":\"HMAC-SHA512\",\"key_id\":\"id\",\"key_version\":1,\"fields\":[],\"tag\":\"{tag}\"}}"
         );
         for rec in [f2, a2] {
-            match verify_input(rec.as_bytes(), key) {
+            match verify_input(rec.as_bytes(), key, None) {
                 VerifyOutcome::Invalid(msg) => {
                     assert!(msg.contains("unsupported"), "message must say unsupported: {msg}");
                 }
@@ -1425,7 +1498,7 @@ mod tests {
         ];
         for token in unsupported {
             for key in ["00ff", "0102"] {
-                match verify_input(record(token).as_bytes(), key) {
+                match verify_input(record(token).as_bytes(), key, None) {
                     VerifyOutcome::Invalid(msg) => {
                         let lower = msg.to_lowercase();
                         assert!(
@@ -1470,7 +1543,7 @@ mod tests {
             let rec = format!(
                 "{{\"format\":{token},\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\"key_version\":1,\"fields\":[],\"tag\":\"{tag}\"}}"
             );
-            match verify_input(rec.as_bytes(), "00ff") {
+            match verify_input(rec.as_bytes(), "00ff", None) {
                 VerifyOutcome::Invalid(msg) => {
                     assert!(
                         !msg.to_lowercase().contains("unsupported"),
@@ -1490,7 +1563,7 @@ mod tests {
         let missing = format!(
             "{{\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\"key_version\":1,\"fields\":[],\"tag\":\"{tag}\"}}"
         );
-        match verify_input(missing.as_bytes(), "00ff") {
+        match verify_input(missing.as_bytes(), "00ff", None) {
             VerifyOutcome::Invalid(msg) => {
                 assert!(msg.contains("missing required member \"format\""), "got: {msg}");
                 assert!(!msg.to_lowercase().contains("unsupported"), "got: {msg}");
@@ -1517,7 +1590,7 @@ mod tests {
             ),
         ];
         for input in framed {
-            match verify_input(input.as_bytes(), "00ff") {
+            match verify_input(input.as_bytes(), "00ff", None) {
                 VerifyOutcome::Invalid(msg) => {
                     assert!(
                         !msg.to_lowercase().contains("unsupported"),
@@ -1545,7 +1618,7 @@ mod tests {
                 "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\"key_version\":{token},\"fields\":[],\"tag\":\"{tag}\"}}"
             );
             for key in ["00ff", "0102"] {
-                match verify_input(rec.as_bytes(), key) {
+                match verify_input(rec.as_bytes(), key, None) {
                     VerifyOutcome::Invalid(msg) => {
                         assert!(
                             msg.contains("key_version"),
@@ -1669,12 +1742,12 @@ mod tests {
             "\"\\u0048\\u004d\\u0041\\u0043\\u002d\\u0053\\u0048\\u0041\\u0032\\u0035\\u0036\"",
         ] {
             assert!(
-                matches!(verify_input(record(spelling).as_bytes(), key), VerifyOutcome::Valid),
+                matches!(verify_input(record(spelling).as_bytes(), key, None), VerifyOutcome::Valid),
                 "spelling {spelling} must verify"
             );
             assert!(
                 matches!(
-                    verify_input(record(spelling).as_bytes(), wrong_key),
+                    verify_input(record(spelling).as_bytes(), wrong_key, None),
                     VerifyOutcome::Mismatch
                 ),
                 "spelling {spelling} under a wrong key must mismatch"
@@ -1694,7 +1767,7 @@ mod tests {
             "\"HMAC-SHA\\u003512\"",
         ] {
             for k in [key, wrong_key] {
-                match verify_input(record(spelling).as_bytes(), k) {
+                match verify_input(record(spelling).as_bytes(), k, None) {
                     VerifyOutcome::Invalid(msg) => {
                         assert!(msg.contains("unsupported"), "{spelling}: {msg}");
                         assert!(msg.contains("HMAC-SHA256"), "{spelling}: {msg}");
@@ -1709,7 +1782,7 @@ mod tests {
         let missing = format!(
             "{{\"format\":1,\"key_id\":\"id\",\"key_version\":1,\"fields\":[\"x\"],\"tag\":\"{tag}\"}}"
         );
-        match verify_input(missing.as_bytes(), key) {
+        match verify_input(missing.as_bytes(), key, None) {
             VerifyOutcome::Invalid(msg) => {
                 assert!(msg.contains("missing required member \"algorithm\""), "{msg}");
                 assert!(!msg.contains("unsupported"), "{msg}");
@@ -1717,12 +1790,217 @@ mod tests {
             other => panic!("expected Invalid, got {other:?}"),
         }
         for token in ["1", "true", "null", "[\"HMAC-SHA256\"]"] {
-            match verify_input(record(token).as_bytes(), key) {
+            match verify_input(record(token).as_bytes(), key, None) {
                 VerifyOutcome::Invalid(msg) => {
                     assert!(msg.contains("must be a string"), "{token}: {msg}");
                     assert!(!msg.contains("unsupported"), "{token}: {msg}");
                 }
                 other => panic!("token {token}: expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    // -- expected-fields checks --------------------------------------------
+
+    #[test]
+    fn expected_fields_parse_accepts_one_string_array() {
+        let ok = |text: &str| parse_expected_fields(text).unwrap();
+        assert_eq!(ok("[]"), Vec::<String>::new());
+        // Leading/trailing JSON whitespace is part of the framing, not content.
+        assert_eq!(ok("  [] \n\t"), Vec::<String>::new());
+        assert_eq!(ok("[\"\"]"), vec![String::new()]);
+        assert_eq!(ok("[\"a\",\"b\",\"a\"]"), vec!["a", "b", "a"]);
+        // Whitespace inside a string, newlines and tabs survive verbatim.
+        assert_eq!(ok("[\" a \",\"x\\ny\",\"\\t\"]"), vec![" a ", "x\ny", "\t"]);
+        // Equivalent escape spellings decode to the same text; no NFC/NFKC.
+        assert_eq!(
+            ok("[\"世\", \"\\u4e16\\u754c\"]"),
+            vec!["世", "世界"]
+        );
+        // Reformatting between elements is irrelevant.
+        assert_eq!(
+            ok("[\n  \"a\" ,\n  \"b\"\n]"),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn expected_fields_parse_rejects_everything_else_without_echoing() {
+        let bad = [
+            // null / other JSON types / non-array values
+            "null",
+            "true",
+            "false",
+            "0",
+            "\"[]\"",
+            "{}",
+            // corrupt or incomplete JSON
+            "",
+            "   ",
+            "[",
+            "[\"a\"",
+            "[\"a\",]",
+            // trailing content after the one array
+            "[] []",
+            "[]x",
+            "[[]]",
+            "[1]",
+            "[\"a\",1]",
+            "[\"a\",null]",
+            "[\"a\",true]",
+            "[{}]",
+        ];
+        let secretish = "[\"SECRET-FIELD-VALUE-42\"] junk";
+        for text in bad {
+            let msg = match parse_expected_fields(text) {
+                Err(msg) => msg,
+                Ok(v) => panic!("expected error for {text:?}, got {v:?}"),
+            };
+            assert!(
+                msg.contains("--expected-fields"),
+                "message must name the option: {msg}"
+            );
+        }
+        let msg = parse_expected_fields(secretish).unwrap_err();
+        assert!(msg.contains("--expected-fields"));
+        // The rejected value must not be quoted back.
+        assert!(
+            !msg.contains("SECRET-FIELD-VALUE-42"),
+            "message must not echo the rejected value: {msg}"
+        );
+    }
+
+    #[test]
+    fn expected_fields_matching_record_verifies() {
+        let key = "00ff";
+        let expect = |fields: &[&str]| fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Exact equality: content, order, repeats and empty fields.
+        let rec = record_for(key, "id", 1, &["hello", "世界", "世界", ""]);
+        assert!(matches!(
+            verify_input(rec.as_bytes(), key, Some(&expect(&["hello", "世界", "世界", ""]))),
+            VerifyOutcome::Valid
+        ));
+        // [] vs the record's [] and [""] vs the record's [""].
+        assert!(matches!(
+            verify_input(record_for(key, "id", 1, &[]).as_bytes(), key, Some(&expect(&[]))),
+            VerifyOutcome::Valid
+        ));
+        assert!(matches!(
+            verify_input(
+                record_for(key, "id", 1, &[""]).as_bytes(),
+                key,
+                Some(&expect(&[""]))
+            ),
+            VerifyOutcome::Valid
+        ));
+        // Internal whitespace and newlines compare on the decoded text.
+        let rec = record_for(key, "id", 1, &[" a ", "x\ny"]);
+        assert!(matches!(
+            verify_input(rec.as_bytes(), key, Some(&expect(&[" a ", "x\ny"]))),
+            VerifyOutcome::Valid
+        ));
+    }
+
+    #[test]
+    fn expected_fields_difference_is_a_plain_mismatch() {
+        let key = "00ff";
+        let expect = |fields: &[&str]| fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let rec = record_for(key, "id", 1, &["a", "b"]);
+
+        // Different content, order and count are each a mismatch, never an
+        // error and never a success.
+        for expected in [
+            &["a", "c"][..],
+            &["b", "a"][..],
+            &["a"][..],
+            &["a", "b", "c"][..],
+            &[" a", "b"][..],
+            &["a\u{300}", "b"][..],
+        ] {
+            assert!(
+                matches!(
+                    verify_input(rec.as_bytes(), key, Some(&expect(expected))),
+                    VerifyOutcome::Mismatch
+                ),
+                "expected mismatch for {expected:?}"
+            );
+        }
+
+        // Zero fields and one empty field cannot satisfy one another.
+        let zero = record_for(key, "id", 1, &[]);
+        let one_empty = record_for(key, "id", 1, &[""]);
+        assert!(matches!(
+            verify_input(zero.as_bytes(), key, Some(&expect(&[""]))),
+            VerifyOutcome::Mismatch
+        ));
+        assert!(matches!(
+            verify_input(one_empty.as_bytes(), key, Some(&expect(&[]))),
+            VerifyOutcome::Mismatch
+        ));
+    }
+
+    #[test]
+    fn expected_fields_cannot_rescue_a_tampered_record() {
+        // Fields changed but the original tag left in place: the expectation
+        // describing the *pre-tamper* message must still fail, because the
+        // record no longer authenticates. A wrong key behaves identically.
+        let key = "00ff";
+        let expect = |fields: &[&str]| fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let original_fields = &["a", "b"];
+        let original = record_for(key, "id", 1, original_fields);
+        // Tamper one field while leaving the (now stale) tag untouched.
+        let tampered = original.replace("\"a\"", "\"c\"");
+        assert_ne!(tampered, original);
+        assert!(matches!(
+            verify_input(
+                tampered.as_bytes(),
+                key,
+                Some(&expect(&["a", "b"]))
+            ),
+            VerifyOutcome::Mismatch
+        ));
+        // And when the record itself is what the expectation names — still a
+        // mismatch, because the tag binds the record to the old content.
+        assert!(matches!(
+            verify_input(
+                tampered.as_bytes(),
+                key,
+                Some(&expect(&["c", "b"]))
+            ),
+            VerifyOutcome::Mismatch
+        ));
+        // Wrong key with matching expectations is the same one-bit result.
+        assert!(matches!(
+            verify_input(
+                original.as_bytes(),
+                "0102",
+                Some(&expect(&["a", "b"]))
+            ),
+            VerifyOutcome::Mismatch
+        ));
+    }
+
+    #[test]
+    fn expected_fields_keep_record_corruption_as_exit_2() {
+        // A structural record problem stays its own error regardless of the
+        // expectation matching or not; it is never laundered into mismatch.
+        let key = "00ff";
+        let expect = |fields: &[&str]| fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let bad_records = [
+            "{".to_string(),
+            "[]".to_string(),
+            format!("{} junk", record_for(key, "id", 1, &["a"])),
+        ];
+        for rec in bad_records {
+            for expected in [None, Some(expect(&["a"])), Some(expect(&[]))] {
+                assert!(
+                    matches!(
+                        verify_input(rec.as_bytes(), key, expected.as_deref()),
+                        VerifyOutcome::Invalid(_)
+                    ),
+                    "expected Invalid for {rec:?} with {expected:?}"
+                );
             }
         }
     }
