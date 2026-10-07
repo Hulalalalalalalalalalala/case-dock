@@ -569,6 +569,183 @@ fn verify_reports_unsupported_format_and_algorithm_explicitly() {
 }
 
 #[test]
+fn verify_huge_and_nonpositive_format_versions_are_unsupported_not_corrupt() {
+    // A legal JSON decimal integer for `format` — including zero, negatives and
+    // integers beyond the platform's usual integer capacity — must read as "an
+    // unsupported record format version", never as corrupt JSON and never
+    // truncated to 1. The record otherwise satisfies every format-1 rule.
+    let key = "00ff";
+    let wrong_key = "0102";
+    let tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let record = |format_token: &str| {
+        format!(
+            r#"{{"format":{format_token},"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[],"tag":"{tag}"}}"#
+        )
+    };
+    let unsupported: &[&str] = &[
+        "0",
+        "-0",
+        "-1",
+        "2",
+        "170141183460469231731687303715884105728", // 2^127, one past i128::MAX
+        "999999999999999999999999999999999999999999999999999",
+        "-170141183460469231731687303715884105729", // -(2^127 + 1)
+        "-999999999999999999999999999999999999999999999999999",
+    ];
+    for token in unsupported {
+        for used_key in [key, wrong_key] {
+            let out = run_verify(used_key, record(token).as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "token {token}: expected exit 2, key={used_key}"
+            );
+            assert!(out.stdout.is_empty(), "token {token}: stdout must be empty");
+            let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+            let lower = stderr.to_lowercase();
+            assert!(
+                lower.contains("unsupported"),
+                "token {token}: must say the version is unsupported, key={used_key}: {stderr}"
+            );
+            assert!(
+                lower.contains("format"),
+                "token {token}: message must name the record format version: {stderr}"
+            );
+            assert!(
+                stderr.contains("format 1"),
+                "token {token}: message must say only format 1 is supported: {stderr}"
+            );
+            // Never echo the rejected digits, the key or record content.
+            assert!(
+                !stderr.contains(token),
+                "token {token}: stderr echoed the rejected number: {stderr}"
+            );
+            assert!(!stderr.contains(used_key), "stderr echoed the key: {stderr}");
+            assert!(
+                !lower.contains("out of supported range"),
+                "token {token}: must not blame JSON integer capacity: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn verify_illegal_format_spellings_keep_corruption_reasons() {
+    // Strings, fractions, exponents and leading zeros are NOT legal integer
+    // spellings: they must remain corrupt input with their own reason, neither
+    // accepted as version 1 nor uniformly reported as an unsupported version.
+    let key = "00ff";
+    let tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let cases: &[(&str, &str)] = &[
+        // (raw format token, text that MUST appear (case-insensitive) in stderr)
+        (r#""1""#, "must be an integer"),
+        ("1.0", "integer"),
+        ("1e0", "integer"),
+        ("01", "leading zero"),
+        ("-01", "leading zero"),
+    ];
+    for (token, expected) in cases {
+        let rec = format!(
+            r#"{{"format":{token},"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[],"tag":"{tag}"}}"#
+        );
+        let stderr = expect_verify_invalid(rec.as_bytes(), &["--key", key]);
+        assert!(
+            !stderr.to_lowercase().contains("unsupported"),
+            "token {token}: an illegal spelling is corruption, not an unsupported version: {stderr}"
+        );
+        assert!(
+            stderr.to_lowercase().contains(expected),
+            "token {token}: stderr must explain {expected:?}: {stderr}"
+        );
+        assert!(!stderr.contains(key), "stderr echoed the key: {stderr}");
+        assert!(
+            !stderr.contains(token),
+            "token {token}: stderr echoed the rejected literal: {stderr}"
+        );
+    }
+
+    // A missing format member keeps the missing-member reason.
+    let missing = format!(
+        r#"{{"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[],"tag":"{tag}"}}"#
+    );
+    let stderr = expect_verify_invalid(missing.as_bytes(), &["--key", key]);
+    assert!(
+        stderr.contains("missing required member \"format\""),
+        "missing format must keep its own reason: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("unsupported"),
+        "missing format is not an unsupported version: {stderr}"
+    );
+}
+
+#[test]
+fn verify_format_version_conclusion_needs_one_complete_record() {
+    // Trailing content, a second object, a duplicate member or truncated JSON
+    // keep the framing/duplicate/truncation rejection: no version conclusion is
+    // drawn from the format number alone.
+    let key = "00ff";
+    let tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let rec = format!(
+        r#"{{"format":2,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[],"tag":"{tag}"}}"#
+    );
+    let bad: &[&str] = &[
+        &format!("{rec} junk"),
+        &format!("{rec}42"),
+        &format!("{rec}{rec}"),
+        "{",
+        &format!(
+            r#"{{"format":2,"format":2,"algorithm":"HMAC-SHA256","key_id":"id","key_version":1,"fields":[],"tag":"{tag}"}}"#
+        ),
+    ];
+    for input in bad {
+        let stderr = expect_verify_invalid(input.as_bytes(), &["--key", key]);
+        assert!(
+            !stderr.to_lowercase().contains("unsupported"),
+            "framing/duplicate/truncation must not be reported as a version problem: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn verify_oversized_key_version_is_not_misreported_as_format_unsupported() {
+    // The key-version range does not widen: beyond u32::MAX — including
+    // integers wider than i128 — stays an illegal key version, and its message
+    // must not mention an unsupported record format.
+    let key = "00ff";
+    let wrong_key = "0102";
+    let tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for token in [
+        "4294967296",
+        "170141183460469231731687303715884105728",
+        "999999999999999999999999999999999999999999999999999",
+        "-170141183460469231731687303715884105729",
+    ] {
+        let rec = format!(
+            r#"{{"format":1,"algorithm":"HMAC-SHA256","key_id":"id","key_version":{token},"fields":[],"tag":"{tag}"}}"#
+        );
+        for used_key in [key, wrong_key] {
+            let out = run_verify(used_key, rec.as_bytes());
+            assert_eq!(out.status.code(), Some(2), "token {token}: expected exit 2");
+            assert!(out.stdout.is_empty(), "token {token}: stdout must be empty");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("key_version"),
+                "token {token}: must report a key_version problem: {stderr}"
+            );
+            assert!(
+                !stderr.to_lowercase().contains("unsupported"),
+                "token {token}: illegal key_version is not an unsupported record format: {stderr}"
+            );
+            assert!(
+                !stderr.contains(token),
+                "token {token}: stderr must not echo the rejected number: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn verify_option_errors_match_sign_and_never_echo_secrets() {
     let key = "00ff";
     let rec = sign_record_bytes(key, "id", "1", &["x"]);
