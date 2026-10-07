@@ -3750,3 +3750,301 @@ fn verify_external_empty_message_and_duplicate_fields_records_verify() {
     let flipped = tag_with_byte_flipped(EXTM_DUP_TAG, 0);
     expect_external_mismatch(dup.replace(EXTM_DUP_TAG, &flipped).as_bytes(), EXTM_KEY);
 }
+
+// ---------------------------------------------------------------------------
+// verify: standard-input byte encoding (UTF-8) regression coverage
+//
+// The record on standard input must be well-formed UTF-8 JSON text: corrupt
+// bytes are never replaced, dropped or carried along into authentication.
+// Encoding corruption is distinct from a *legal* record whose tag does not
+// match: the former is exit 2 with empty stdout and a UTF-8 explanation on
+// stderr, the latter exit 1 with {"valid":false} and empty stderr. The
+// replacement character U+FFFD itself is ordinary message content whenever
+// it arrives as legal UTF-8 (raw bytes or a ￿ escape): it authenticates
+// like any other character and must never be treated as a sign of decoding
+// failure.
+// ---------------------------------------------------------------------------
+
+const ENC_KEY: &str = "00ff";
+/// A different, well-formed key: encoding corruption must be reported as
+/// corrupt input regardless of which legal key is supplied.
+const ENC_WRONG_KEY: &str = "0102";
+/// Golden tag (independent Python HMAC over the format-1 contract in
+/// README.md) for key_id "id", version 1, fields ["消息\u{fffd}text"]:
+/// the replacement character U+FFFD as ordinary message content.
+const ENC_FFFD_TAG: &str = "2d22daf4b568b1913d42f238b052ea7067cf9c5a374ccacd424bb615a63ffd58";
+/// Golden tag for the same record with a plain 'A' where U+FFFD sits above.
+const ENC_PLAIN_TAG: &str = "fcab3a75b38936d5d97c7e8dbe75b3ddb79ea8a7ef025dfe860d5a0176997acb";
+/// Golden tag for key_id "ext-tool", version 11,
+/// fields ["line1\u{fffd}line2", "标签"] under EXTT_KEY.
+const ENC_EXTT_FFFD_TAG: &str = "df1f9cf3ef5466b3932772fa5d2438e1c2d6ef0075138d5d5d95fa08eed2cd79";
+/// Golden tag for key_id "外部\u{fffd}工具", version 2, fields ["重复"]
+/// under EXTM_KEY.
+const ENC_EXTM_FFFD_KID_TAG: &str = "8089329dde09eee5ec183233ed46a2475de57c4feec7f3dfc1ca4f9e050f5360";
+
+/// Assert that `input` is rejected as encoding-corrupt input: exit 2, empty
+/// stdout, and a stderr that names the UTF-8 problem without echoing the
+/// key, the record content or the corrupt bytes (a U+FFFD on stderr would
+/// mean the corrupt bytes were lossily decoded and quoted back).
+fn expect_invalid_utf8_rejection(label: &str, input: &[u8], key: &str, record_text: &[&str]) {
+    let out = run_verify(key, input);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{label}: expected exit 2, stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "{label}: stdout must be empty on exit 2");
+    let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+    assert!(!stderr.trim().is_empty(), "{label}: stderr must explain the problem");
+    assert!(
+        stderr.contains("UTF-8"),
+        "{label}: stderr must say the input is not valid UTF-8 text: {stderr}"
+    );
+    assert!(!stderr.contains(key), "{label}: stderr echoed the key: {stderr}");
+    for text in record_text {
+        assert!(
+            !stderr.contains(text),
+            "{label}: stderr echoed record content {text:?}: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains('\u{fffd}'),
+        "{label}: stderr must not quote corrupt bytes back via lossy decoding: {stderr}"
+    );
+}
+
+#[test]
+fn verify_rejects_invalid_utf8_anywhere_in_a_complete_record() {
+    // A valid record mixing English and Chinese; it verifies cleanly, so any
+    // rejection below is caused by the injected bytes and nothing else.
+    let body = String::from_utf8(sign_record_bytes(ENC_KEY, "id", "1", &["hello世界", "text"]))
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+    let out = run_verify(ENC_KEY, format!("{body}\n").as_bytes());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "control record must verify, stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    let tag = tag_of(&body);
+
+    // Corrupt-byte patterns: isolated continuation bytes, multibyte sequences
+    // missing their later bytes, overlong (longer than standard) spellings of
+    // an ASCII character, and a byte that is never legal UTF-8.
+    let patterns: &[(&str, &[u8])] = &[
+        ("isolated continuation byte 0x80", &[0x80]),
+        ("isolated continuation byte 0xbf", &[0xbf]),
+        ("truncated three-byte sequence", &[0xe4, 0xb8]),
+        ("truncated four-byte sequence", &[0xf0, 0x9f, 0x99]),
+        ("overlong two-byte spelling of '/'", &[0xc0, 0xaf]),
+        ("overlong three-byte spelling", &[0xe0, 0x80, 0xaf]),
+        ("byte 0xff", &[0xff]),
+    ];
+
+    // Insert `corrupt` right after `anchor` inside the otherwise untouched
+    // record. The object, its members and the string quotes stay complete —
+    // only the byte encoding is broken — which the restoration check proves.
+    let insert_after = |anchor: &str, corrupt: &[u8]| -> Vec<u8> {
+        let at = body
+            .find(anchor)
+            .unwrap_or_else(|| panic!("anchor {anchor:?} must be present in {body}"))
+            + anchor.len();
+        let mut corrupted = body.as_bytes().to_vec();
+        corrupted.splice(at..at, corrupt.iter().copied());
+        let mut restored = corrupted.clone();
+        restored.splice(at..at + corrupt.len(), []);
+        assert_eq!(
+            restored,
+            body.as_bytes(),
+            "removing the corrupt bytes must restore the exact valid record"
+        );
+        corrupted
+    };
+
+    // Distinctive record content that stderr must never quote back ("id" and
+    // "text" are excluded: both legitimately appear in the fixed message
+    // "input is not valid UTF-8 JSON text").
+    let record_text = ["hello", "世界", tag.as_str()];
+    let anchors = [
+        ("field string, between English and Chinese", "\"hello"),
+        ("second field string", "\"te"),
+        ("key id string", "\"key_id\":\"i"),
+    ];
+    for (plabel, corrupt) in patterns {
+        for (alabel, anchor) in anchors {
+            let input = insert_after(anchor, corrupt);
+            assert!(
+                std::str::from_utf8(&input).is_err(),
+                "{plabel} in {alabel}: the constructed input must be invalid UTF-8"
+            );
+            for key in [ENC_KEY, ENC_WRONG_KEY] {
+                expect_invalid_utf8_rejection(
+                    &format!("{plabel} in {alabel}"),
+                    &input,
+                    key,
+                    &record_text,
+                );
+            }
+        }
+        // Corruption after the complete object: the record is whole, the
+        // bytes behind it are not text.
+        let mut input = body.as_bytes().to_vec();
+        input.extend_from_slice(corrupt);
+        input.push(b'\n');
+        assert!(std::str::from_utf8(&input).is_err());
+        for key in [ENC_KEY, ENC_WRONG_KEY] {
+            expect_invalid_utf8_rejection(
+                &format!("{plabel} after the complete object"),
+                &input,
+                key,
+                &record_text,
+            );
+        }
+    }
+}
+
+#[test]
+fn verify_legal_ufffd_is_message_content_not_encoding_corruption() {
+    // Hand-authored from the published format 1 contract with an independent
+    // Python golden tag; `sign` is never invoked, so a shared sign/verify bug
+    // cannot make this pass. U+FFFD is written as raw UTF-8 bytes on the wire.
+    let raw_record = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\"key_version\":1,\"fields\":[\"消息\u{fffd}text\"],\"tag\":\"{ENC_FFFD_TAG}\"}}"
+    );
+    assert!(
+        raw_record.contains('\u{fffd}'),
+        "the character must be raw UTF-8 on the wire"
+    );
+
+    // The same character as a JSON Unicode escape: identical decoded text.
+    let escaped_record = raw_record.replace('\u{fffd}', "\\ufffd");
+    assert_ne!(escaped_record, raw_record, "the escape rewrite must change the wire text");
+    assert!(!escaped_record.contains('\u{fffd}'));
+
+    for (label, rec) in [("raw UTF-8", &raw_record), ("\\ufffd escape", &escaped_record)] {
+        let out = run_verify(ENC_KEY, rec.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{label}: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}: stderr must be empty");
+
+        // A format-legal but wrong key turns the same legal record into an
+        // ordinary mismatch — never into an encoding-corruption report.
+        let out = run_verify(ENC_WRONG_KEY, rec.as_bytes());
+        assert_eq!(out.status.code(), Some(1), "{label}: wrong key must mismatch");
+        assert_eq!(out.stdout, b"{\"valid\":false}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}: stderr must be empty");
+    }
+
+    // Keeping the original tag while changing one ordinary character of the
+    // message to a legal U+FFFD: still legal input, but the authenticated
+    // content changed, so this is {"valid":false} — not corrupt input.
+    let plain_record = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"id\",\"key_version\":1,\"fields\":[\"消息Atext\"],\"tag\":\"{ENC_PLAIN_TAG}\"}}"
+    );
+    let out = run_verify(ENC_KEY, plain_record.as_bytes());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "control: the untampered record must verify, stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+
+    for (label, tampered) in [
+        ("raw UTF-8", plain_record.replace("消息Atext", "消息\u{fffd}text")),
+        ("\\ufffd escape", plain_record.replace("消息Atext", "消息\\ufffdtext")),
+    ] {
+        assert_ne!(tampered, plain_record, "{label}: the tamper must change the wire text");
+        let out = run_verify(ENC_KEY, tampered.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{label}: expected mismatch, stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":false}\n", "{label}");
+        assert!(out.stderr.is_empty(), "{label}: stderr must be empty");
+    }
+}
+
+#[test]
+fn verify_external_ufffd_records_follow_the_same_encoding_rules() {
+    // Produced as another program would from the published format 1 contract
+    // (independent Python golden tags; `sign` is never invoked).
+    let field_record = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"ext-tool\",\"key_version\":11,\"fields\":[\"line1\u{fffd}line2\",\"标签\"],\"tag\":\"{ENC_EXTT_FFFD_TAG}\"}}"
+    );
+    let kid_record = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"外部\u{fffd}工具\",\"key_version\":2,\"fields\":[\"重复\"],\"tag\":\"{ENC_EXTM_FFFD_KID_TAG}\"}}"
+    );
+    for (label, key, rec) in [
+        ("U+FFFD in a field", EXTT_KEY, &field_record),
+        ("U+FFFD in the key id", EXTM_KEY, &kid_record),
+    ] {
+        for (slabel, wire) in [
+            ("raw UTF-8", rec.clone()),
+            ("\\ufffd escape", rec.replace('\u{fffd}', "\\ufffd")),
+        ] {
+            let out = run_verify(key, wire.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{label}/{slabel}: stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"{\"valid\":true}\n", "{label}/{slabel}");
+            assert!(out.stderr.is_empty(), "{label}/{slabel}");
+        }
+
+        // One changed tag byte is an ordinary mismatch, not corruption.
+        let tag = tag_of(rec);
+        let flipped = tag_with_byte_flipped(&tag, 31);
+        let out = run_verify(key, rec.replace(&tag, &flipped).as_bytes());
+        assert_eq!(out.status.code(), Some(1), "{label}: changed tag byte must mismatch");
+        assert_eq!(out.stdout, b"{\"valid\":false}\n");
+        assert!(out.stderr.is_empty(), "{label}");
+    }
+
+    // The published external record from the tag-rules section: keep its tag,
+    // change one ordinary character of the message to a legal U+FFFD. Legal
+    // input, changed content: {"valid":false}, never an encoding error.
+    let external = format!(
+        "{{\"format\":1,\"algorithm\":\"HMAC-SHA256\",\"key_id\":\"ext-tool\",\"key_version\":11,\"fields\":[\"line1\\nline2\",\"标签\",\"\"],\"tag\":\"{EXTT_TAG}\"}}"
+    );
+    let out = run_verify(EXTT_KEY, external.as_bytes());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "control: the published record must verify, stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tampered = external.replace("标签", "标\u{fffd}");
+    assert_ne!(tampered, external);
+    let out = run_verify(EXTT_KEY, tampered.as_bytes());
+    assert_eq!(out.status.code(), Some(1), "expected mismatch");
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+    assert!(out.stderr.is_empty());
+
+    // Corrupt bytes inside an external record are still encoding corruption:
+    // exit 2, never {"valid":false}.
+    let at = field_record.find("line1").expect("anchor must be present") + "line1".len();
+    let mut corrupt = field_record.into_bytes();
+    corrupt.splice(at..at, [0x80]);
+    assert!(std::str::from_utf8(&corrupt).is_err());
+    expect_invalid_utf8_rejection(
+        "corrupt byte in an external record",
+        &corrupt,
+        EXTT_KEY,
+        &["line1", "标签"],
+    );
+}
