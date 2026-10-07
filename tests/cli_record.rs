@@ -4256,3 +4256,248 @@ fn verify_algorithm_missing_or_non_string_keeps_its_own_reason() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// verify: JSON layout whitespace vs message-content whitespace
+//
+// Format 1 authenticates the JSON-*decoded* text, so the two kinds of
+// whitespace must never be unified: insignificant layout whitespace (U+0020,
+// U+0009, U+000A, U+000D) may be added or removed around the record's
+// punctuation without changing the result, while look-alike characters
+// (U+00A0 NO-BREAK SPACE, U+3000 IDEOGRAPHIC SPACE) are NOT JSON whitespace —
+// outside strings they corrupt the input, inside strings they are ordinary
+// message content that is authenticated verbatim. Every golden tag below is
+// an independent Python hmac/hashlib/struct computation over the format-1
+// contract in README.md, never taken from this crate's own HMAC code.
+// ---------------------------------------------------------------------------
+
+const LYT_KEY: &str = "00112233445566778899aabbccddeeff";
+/// A different but well-formed key: layout freedom must never launder it.
+const LYT_WRONG_KEY: &str = "0102";
+const LYT_KID: &str = "layout-kid";
+/// Golden tag for (LYT_KEY, "layout-kid", 6, ["alpha", "beta gamma", ""]).
+/// The field with an embedded U+0020 and the trailing empty field pin field
+/// content and boundaries against any layout reformatting.
+const LYT_TAG: &str = "9a1bde9780d560e95de59d60afed0c8a1690f53b7b8c36de68496b5dd21ce696";
+
+/// The compact record body (no trailing newline) the layout tests reformat,
+/// checked against the independent golden tag so a shared sign/verify bug
+/// cannot make these tests pass.
+fn layout_record_body() -> String {
+    let bytes = sign_record_bytes(LYT_KEY, LYT_KID, "6", &["alpha", "beta gamma", ""]);
+    let rec = parse_single_record(&bytes);
+    assert_eq!(rec.tag, LYT_TAG, "layout record must carry the golden tag");
+    String::from_utf8(bytes)
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+/// Insert the JSON whitespace string `ws` at every position JSON allows
+/// insignificant whitespace: before and after the object, after the opening
+/// brace and before the closing one, around every member colon, around every
+/// comma, and inside the fields array around its brackets. The record's field
+/// texts contain no structural punctuation, so each rewrite touches only the
+/// record's own punctuation and never the field content.
+fn reformat_with(body: &str, ws: &str) -> String {
+    let inner = body
+        .replace("\":", &format!("\"{ws}:{ws}"))
+        .replace(',', &format!("{ws},{ws}"))
+        .replace('[', &format!("[{ws}"))
+        .replace(']', &format!("{ws}]"))
+        .replacen('{', &format!("{{{ws}"), 1);
+    let inner = format!(
+        "{}{ws}}}",
+        inner.strip_suffix('}').expect("record body ends with }")
+    );
+    format!("{ws}{inner}{ws}")
+}
+
+#[test]
+fn verify_json_layout_whitespace_never_changes_authentication() {
+    let body = layout_record_body();
+    // Each JSON whitespace character on its own, then all four mixed, at
+    // every legal insignificant-whitespace position at once: U+0020 space,
+    // U+0009 tab, U+000A line feed, U+000D carriage return.
+    for ws in [" ", "\t", "\n", "\r", " \t\n\r", "\r\n\t  \t\r\n"] {
+        let reformatted = reformat_with(&body, ws);
+        assert_ne!(reformatted, body, "ws {ws:?}: reformatting must change the bytes");
+
+        let out = run_verify(LYT_KEY, reformatted.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "ws {ws:?}: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n", "ws {ws:?}: stdout");
+        assert!(out.stderr.is_empty(), "ws {ws:?}: stderr must be empty");
+
+        // Reformatting cannot launder a wrong key either: the same bytes
+        // under a different well-formed key stay a plain mismatch.
+        let out = run_verify(LYT_WRONG_KEY, reformatted.as_bytes());
+        assert_eq!(out.status.code(), Some(1), "ws {ws:?}: wrong key must mismatch");
+        assert_eq!(out.stdout, b"{\"valid\":false}\n", "ws {ws:?}: stdout");
+        assert!(out.stderr.is_empty(), "ws {ws:?}: stderr must be empty");
+    }
+}
+
+#[test]
+fn verify_lookalike_spaces_outside_strings_are_corrupt_input() {
+    let body = layout_record_body();
+    // U+00A0 and U+3000 look like spacing but are not JSON whitespace. Wherever
+    // they appear outside a string — before the object, after the complete
+    // object, or between members — the input is corrupt (exit 2), never a
+    // verification result, under the correct key and a wrong key alike.
+    let mut variants: Vec<String> = Vec::new();
+    for lookalike in ["\u{a0}", "\u{3000}"] {
+        variants.push(format!("{lookalike}{body}")); // before the object
+        variants.push(format!("{body}{lookalike}")); // after the complete object
+        variants.push(body.replacen('{', &format!("{{{lookalike}"), 1)); // before the first member
+        variants.push(body.replacen(',', &format!("{lookalike},"), 1)); // before a comma
+        variants.push(body.replacen(',', &format!(",{lookalike}"), 1)); // between members
+        variants.push(body.replacen(':', &format!(":{lookalike}"), 1)); // after a colon
+    }
+    for input in &variants {
+        for key in [LYT_KEY, LYT_WRONG_KEY] {
+            let out = run_verify(key, input.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "input must be rejected as corrupt, key={key}, stdout={:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(out.stdout.is_empty(), "stdout must be empty on exit 2");
+            let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+            assert!(!stderr.trim().is_empty(), "stderr must explain the problem");
+            assert!(
+                stderr.to_lowercase().contains("json"),
+                "stderr must describe the JSON parse/trailing-content problem: {stderr}"
+            );
+            // Never echo the key, the key id, field contents or the record.
+            assert!(!stderr.contains(key), "stderr echoed the key: {stderr}");
+            assert!(!stderr.contains(LYT_KID), "stderr echoed the key id: {stderr}");
+            assert!(!stderr.contains("alpha"), "stderr echoed a field: {stderr}");
+            assert!(!stderr.contains("beta gamma"), "stderr echoed a field: {stderr}");
+            assert!(!stderr.contains(LYT_TAG), "stderr echoed the tag/record: {stderr}");
+        }
+    }
+
+    // Inside a member NAME the lookalike is string content, so the record
+    // still parses — but the renamed member is not one of the six record
+    // members, which stays a structural rejection (exit 2, empty stdout, no
+    // echo), never a verification result.
+    for lookalike in ["\u{a0}", "\u{3000}"] {
+        let renamed = body.replacen("\"format\":", &format!("\"format{lookalike}\":"), 1);
+        assert_ne!(renamed, body);
+        for key in [LYT_KEY, LYT_WRONG_KEY] {
+            let out = run_verify(key, renamed.as_bytes());
+            assert_eq!(out.status.code(), Some(2), "key={key}");
+            assert!(out.stdout.is_empty(), "stdout must be empty on exit 2");
+            let stderr = String::from_utf8(out.stderr).expect("stderr must be UTF-8");
+            assert!(!stderr.trim().is_empty(), "stderr must explain the problem");
+            assert!(!stderr.contains(key), "stderr echoed the key: {stderr}");
+            assert!(!stderr.contains(LYT_KID), "stderr echoed the key id: {stderr}");
+            assert!(!stderr.contains("beta gamma"), "stderr echoed a field: {stderr}");
+            assert!(!stderr.contains(LYT_TAG), "stderr echoed the tag/record: {stderr}");
+        }
+    }
+}
+
+const NBSP_KEY: &str = "00ff";
+const NBSP_WRONG_KEY: &str = "0102";
+const NBSP_KID: &str = "nbsp-kid";
+/// Fields exercising U+00A0/U+3000 as content: at both ends of a field, as
+/// the whole field, in the middle, and mixed with ordinary U+0020 spaces.
+const NBSP_FIELDS: &[&str] = &[
+    "\u{a0}keep me\u{3000}",
+    "\u{a0}",
+    "\u{3000}\u{a0}",
+    "mid\u{a0}dle",
+    " \u{a0} ",
+    "\u{3000} \u{3000}",
+];
+/// Golden tag for (NBSP_KEY, "nbsp-kid", 4, NBSP_FIELDS).
+const NBSP_TAG: &str = "ee5efd768f05d18ac1968411355482618667bfe7121edbca26a18144d20db4f3";
+
+#[test]
+fn verify_lookalike_spaces_inside_fields_are_message_content() {
+    // Signing keeps the characters verbatim — they are data, not layout — and
+    // the tag matches the independent golden value over the untrimmed text.
+    let bytes = sign_record_bytes(NBSP_KEY, NBSP_KID, "4", NBSP_FIELDS);
+    let rec = parse_single_record(&bytes);
+    assert_eq!(rec.tag, NBSP_TAG, "lookalike characters must be authenticated verbatim");
+    assert_eq!(
+        rec.fields,
+        NBSP_FIELDS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "fields must round-trip character for character"
+    );
+    let body = String::from_utf8(bytes)
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+    assert!(
+        body.contains('\u{a0}') && body.contains('\u{3000}'),
+        "printable lookalikes stay raw UTF-8 on the wire: {body}"
+    );
+
+    // The record verifies as-is: exit 0, exactly one {"valid":true} line,
+    // empty stderr. Under a wrong key it is a plain mismatch, never corrupt.
+    let out = run_verify(NBSP_KEY, body.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "stderr={:?}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"{\"valid\":true}\n");
+    assert!(out.stderr.is_empty());
+    let out = run_verify(NBSP_WRONG_KEY, body.as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"{\"valid\":false}\n");
+    assert!(out.stderr.is_empty());
+
+    // Writing the same characters as JSON unicode escapes decodes to the same
+    // text and must verify identically — each escape spelling on its own and
+    // both together.
+    for escaped in [
+        body.replace('\u{a0}', "\\u00a0"),
+        body.replace('\u{3000}', "\\u3000"),
+        body.replace('\u{a0}', "\\u00a0").replace('\u{3000}', "\\u3000"),
+    ] {
+        assert_ne!(escaped, body, "escape spelling must differ on the wire");
+        let out = run_verify(NBSP_KEY, escaped.as_bytes());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "escaped spelling must verify: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"{\"valid\":true}\n");
+        assert!(out.stderr.is_empty());
+    }
+
+    // Keeping the original tag while deleting the lookalike whitespace or
+    // replacing it with ordinary U+0020 spaces changes the authenticated
+    // content: the record stays structurally legal but must be a mismatch
+    // (exit 1, one {"valid":false} line, empty stderr) — never trimmed into a
+    // match, under the correct key and a wrong key alike.
+    let tampered = [
+        body.replacen("\"\u{a0}keep me", "\"keep me", 1), // strip a leading U+00A0
+        body.replacen("keep me\u{3000}\"", "keep me\"", 1), // strip a trailing U+3000
+        body.replacen("\"\u{a0}\"", "\"\"", 1),           // empty out a lookalike-only field
+        body.replace('\u{a0}', ""),                       // delete every U+00A0
+        body.replace('\u{3000}', ""),                     // delete every U+3000
+        body.replace('\u{a0}', " "),                      // U+00A0 -> U+0020
+        body.replace('\u{3000}', " "),                    // U+3000 -> U+0020
+    ];
+    for rec_text in &tampered {
+        assert_ne!(rec_text, &body, "tampering must change the record bytes");
+        for key in [NBSP_KEY, NBSP_WRONG_KEY] {
+            let out = run_verify(key, rec_text.as_bytes());
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "tampered record must be a mismatch, key={key}, stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"{\"valid\":false}\n");
+            assert!(out.stderr.is_empty(), "mismatch must be silent on stderr");
+        }
+    }
+}
